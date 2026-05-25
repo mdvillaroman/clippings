@@ -1,0 +1,17 @@
+{
+  "name": "clippings-server",
+  "version": "1.0.0",
+  "description": "Backend for Clippings — live metrics + 24/7 news monitoring.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
