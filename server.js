@@ -252,9 +252,13 @@ app.delete('/api/reports/:slug', requireToken, (req, res) => {
 });
 
 // ── Serve the app itself (single-deploy: API + frontend, one URL) ───
-// The Clippings app lives in ./public. API and /r routes above take
-// priority; everything else is served as static files.
-app.use(express.static(path.join(__dirname, 'public')));
+// The app is a single index.html. Serve it at the root from wherever it
+// sits — repo root or ./public — and expose nothing else (no static dir,
+// so store.json / server.js stay private). API and /r routes above win.
+const APP_HTML = fs.existsSync(path.join(__dirname, 'index.html'))
+  ? path.join(__dirname, 'index.html')
+  : path.join(__dirname, 'public', 'index.html');
+app.get('/', (req, res) => res.sendFile(APP_HTML));
 
 // ── Monitoring sweep (runs on a schedule) ───────────────────────────
 let _sweeping = false;
