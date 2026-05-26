@@ -572,6 +572,18 @@ img { display: block; max-width: 100%; }
 const DB = 'clippings_v2';
 let books = [];
 let settings = { backendUrl: '', apiToken: '', oprKey: '', simKey: '', agency: 'VillaromanPR', agencyUrl: 'villaromanpr.com', agencyEmail: '', agencyAddress: '', currency: 'PHP', paymentDetails: '', retainerUSD: 1500, perPlacementUSD: 200, toolsDiscountUSD: 35 };
+
+// ── Team access (owner / staff) ─────────────────────────────────────
+// `role` gates the UI; `auth.code` is the passcode sent to the backend on
+// every API call (header X-Clippings-Pass). Default 'owner' keeps local /
+// browser-only mode (no backend) at full access.
+let role = 'owner';
+let auth = { code: '', role: 'owner' };
+try { const _a = JSON.parse(localStorage.getItem('clippings_auth') || 'null'); if (_a && _a.code) { auth = _a; role = _a.role || 'owner'; } } catch {}
+function apiHeaders(extra) { return { ...(extra || {}), ...(auth.code ? { 'X-Clippings-Pass': auth.code } : {}) }; }
+function setAuth(code, r) { auth = { code, role: r }; role = r; localStorage.setItem('clippings_auth', JSON.stringify(auth)); }
+function logout() { localStorage.removeItem('clippings_auth'); auth = { code: '', role: 'owner' }; location.reload(); }
+function isOwner() { return role === 'owner'; }
 let _lastCloudPush = 0;
 
 // Normalized backend base URL (no trailing slash), or '' if not set.
@@ -649,7 +661,7 @@ function cloudPush() {
     try {
       await fetch(`${base}/api/library`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(settings.apiToken ? { 'X-Clippings-Token': settings.apiToken } : {}) },
+        headers: apiHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ books, settings, updatedAt: _localUpdatedAt }),
       });
     } catch {}
@@ -661,7 +673,7 @@ async function cloudPull() {
   const base = backendBase();
   if (!base) return;
   try {
-    const r = await fetch(`${base}/api/library`);
+    const r = await fetch(`${base}/api/library`, { headers: apiHeaders() });
     const j = await r.json();
     if (j && Array.isArray(j.books) && (+j.updatedAt || 0) > _localUpdatedAt) {
       books = j.books;
@@ -682,7 +694,7 @@ async function backupNow() {
   try {
     const r = await fetch(`${base}/api/library`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(settings.apiToken ? { 'X-Clippings-Token': settings.apiToken } : {}) },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ books, settings, updatedAt: _localUpdatedAt }),
     });
     const j = await r.json();
@@ -697,7 +709,7 @@ function restoreFromCloud() {
   if (!base) { toast('Connect your backend in Settings first'); return; }
   confirmAction('Restore from cloud?', 'This replaces what’s on this device with your latest backup.', async () => {
     try {
-      const r = await fetch(`${base}/api/library`);
+      const r = await fetch(`${base}/api/library`, { headers: apiHeaders() });
       const j = await r.json();
       if (j && Array.isArray(j.books)) {
         books = j.books;
@@ -1165,7 +1177,7 @@ async function refreshLiveMetrics(bookId) {
     if (base) {
       // Backend holds the keys and returns DA + traffic together.
       try {
-        const r = await fetch(`${base}/api/metrics?domain=${encodeURIComponent(domain)}`);
+        const r = await fetch(`${base}/api/metrics?domain=${encodeURIComponent(domain)}`, { headers: apiHeaders() });
         const j = await r.json();
         if (j.domainAuthority != null) { c.domainAuthority = j.domainAuthority; c.pageRank = j.pageRank || 0; c.daSource = j.sources?.da || 'OpenPageRank'; updated++; }
         if (j.visits != null) { c.reach = j.visits; c.reachSource = j.sources?.traffic || 'SimilarWeb'; updated++; }
@@ -1207,7 +1219,7 @@ async function syncMonitorsToBackend() {
     .map(b => ({ id: b.id, name: b.client || b.name, keywords: (b.monitors || []).map(m => m.keyword).filter(Boolean) }));
   try {
     await fetch(`${base}/api/monitors/sync`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ clients }),
     });
   } catch {}
@@ -1219,7 +1231,7 @@ async function pullBackendMentions() {
   if (!base) return 0;
   let added = 0;
   try {
-    const r = await fetch(`${base}/api/mentions`);
+    const r = await fetch(`${base}/api/mentions`, { headers: apiHeaders() });
     const j = await r.json();
     for (const m of (j.mentions || [])) {
       const b = books.find(x => x.id === m.clientId);
@@ -1332,14 +1344,724 @@ function setTab(tab) {
 
 function render() {
   const root = document.getElementById('root');
+  if (!isOwner() && nav.view === 'invoice') nav.view = 'home';  // invoicing is owner-only
   const b = nav.bookId ? books.find(x => x.id === nav.bookId) : null;
   switch(nav.view) {
-    case 'home':    root.innerHTML = pageHome(); break;
-    case 'book':    root.innerHTML = b ? pageBook(b) : pageHome(); break;
-    case 'report':  root.innerHTML = b ? pageReport(b) : pageHome(); break;
-    case 'invoice': root.innerHTML = b ? pageInvoice(b) : pageHome(); break;
-    default:        root.innerHTML = pageHome();
+    case 'home':     root.innerHTML = pageHome(); break;
+    case 'book':     root.innerHTML = b ? pageBook(b) : pageHome(); break;
+    case 'report':   root.innerHTML = b ? pageReport(b) : pageHome(); break;
+    case 'invoice':  root.innerHTML = b ? pageInvoice(b) : pageHome(); break;
+    case 'newsroom': root.innerHTML = pageNewsroom(); break;
+    case 'intel':    root.innerHTML = pageIntel(); break;
+    case 'media':    root.innerHTML = pageMedia(); break;
+    case 'pitches':  root.innerHTML = pagePitches(); break;
+    default:         root.innerHTML = pageHome();
   }
+}
+
+// Shared top navigation (Projects / Newsroom / Daily Intel + role + settings).
+function navLink(label, view, active) {
+  const on = active === view;
+  return `<button onclick="go('${view}')" class="btn btn-ghost btn-sm" style="padding:6px 12px;white-space:nowrap;flex-shrink:0;${on ? 'color:var(--ink);background:var(--paper-2);' : 'color:var(--ink-3);'}">${label}</button>`;
+}
+function roleChip() {
+  if (!auth.code) return '';  // local / no-auth mode: no chip
+  const label = role === 'staff' ? 'Staff' : 'Owner';
+  return `<span class="mono hide-mobile" title="Signed in as ${label} — click to log out" onclick="logout()" style="cursor:pointer;font-size:.58rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--ink-3);border:1px solid var(--rule);border-radius:100px;padding:3px 9px;">${label}</span>`;
+}
+function topNav(active) {
+  return `
+  <nav class="no-print glass-nav" aria-label="Main">
+    <div class="wrap flex-between" style="padding:14px 32px;gap:16px;">
+      <div class="flex" style="align-items:center;gap:6px;min-width:0;">
+        <div class="wordmark" onclick="go('home')" style="cursor:pointer;"><span class="wordmark-dot"></span><span>Clippings</span></div>
+        <div style="display:flex;gap:2px;margin-left:10px;overflow-x:auto;min-width:0;-webkit-overflow-scrolling:touch;scrollbar-width:none;">
+          ${navLink('Projects', 'home', active)}
+          ${navLink('Newsroom', 'newsroom', active)}
+          ${navLink('Media List', 'media', active)}
+          ${navLink('Pitches', 'pitches', active)}
+          ${navLink('Daily Intel', 'intel', active)}
+        </div>
+      </div>
+      <div class="flex gap-2" style="align-items:center;flex-shrink:0;">
+        ${roleChip()}
+        <button onclick="openSettingsModal()" class="btn btn-ghost btn-sm" aria-label="Settings" style="padding:6px 10px;"><svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+        ${active === 'home' ? `<button onclick="openNewBookModal()" class="btn btn-primary btn-sm">New book</button>` : ''}
+      </div>
+    </div>
+  </nav>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAGE: MEDIA LIST — the shared journalist/influencer database
+// ═══════════════════════════════════════════════════════════════════
+// Backend-first (shared via /api/contacts); falls back to localStorage in
+// browser-only mode. Auto-grows from the Newsroom's byline harvest + the
+// daily brief's discovery; you import your existing list once via CSV.
+let _contacts = [];
+let _mediaFilter = { q: '', status: 'all' };
+function _saveLocalContacts() { try { localStorage.setItem('clippings_contacts', JSON.stringify(_contacts)); } catch {} }
+function _readLocalContacts() { try { return JSON.parse(localStorage.getItem('clippings_contacts') || '[]'); } catch { return []; } }
+// Backend = sync; localStorage = the device's durable copy. If the server ever
+// comes back empty (free-tier disk reset), restore it from this device.
+async function fetchContacts() {
+  const base = backendBase();
+  if (base) {
+    try {
+      const r = await fetch(`${base}/api/contacts`, { headers: apiHeaders() });
+      const j = await r.json(); const remote = j.contacts || []; const local = _readLocalContacts();
+      if (!remote.length && local.length) {
+        try { await fetch(`${base}/api/contacts`, { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ contacts: local }) }); } catch {}
+        _contacts = local; return _contacts;
+      }
+      _contacts = remote; _saveLocalContacts(); return _contacts;
+    } catch {}
+  }
+  _contacts = _readLocalContacts(); return _contacts;
+}
+async function upsertContacts(arr) {
+  const nz = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  for (const c of arr) {
+    if (!c.id && !c.name) continue;
+    let ex = c.id ? _contacts.find(x => x.id === c.id) : _contacts.find(x => nz(x.name) === nz(c.name) && nz(x.outlet) === nz(c.outlet));
+    if (ex) Object.assign(ex, c); else { c.id = c.id || ('c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)); c.createdAt = c.createdAt || Date.now(); _contacts.push(c); }
+  }
+  _saveLocalContacts();
+  const base = backendBase();
+  if (base) { try { await fetch(`${base}/api/contacts`, { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ contacts: arr }) }); } catch {} }
+}
+async function deleteContactById(id) {
+  _contacts = _contacts.filter(x => x.id !== id); _saveLocalContacts();
+  const base = backendBase();
+  if (base) { try { await fetch(`${base}/api/contacts/${id}`, { method: 'DELETE', headers: apiHeaders() }); } catch {} }
+}
+function contactClientNames(c) {
+  return (c.clients || []).map(id => { const b = books.find(x => x.id === id); return b ? (b.client || b.name) : ''; }).filter(Boolean);
+}
+function isStale(c) {
+  const d = c.lastTouch || c.lastSeen || ''; if (!d) return false;
+  const t = Date.parse(d); if (isNaN(t)) return false;
+  return (Date.now() - t) > 14 * 24 * 60 * 60 * 1000;
+}
+function statusChip(s) {
+  const map = { active: { t: 'Active', c: '#2d7a4a' }, warm: { t: 'Warm', c: '#b8860b' }, cold: { t: 'Cold', c: 'var(--ink-3)' }, declined: { t: 'Declined', c: 'var(--red)' } };
+  const v = map[(s || '').toLowerCase()]; if (!v) return '';
+  return `<span style="font-family:var(--font-mono);font-size:.58rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:${v.c};">${v.t}</span>`;
+}
+
+function pageMedia() {
+  setTimeout(loadMedia, 0);
+  return `
+  ${topNav('media')}
+  <header class="wrap" style="padding:64px 32px 24px;">
+    <div class="flex-between" style="align-items:flex-end;gap:24px;">
+      <div style="min-width:0;">
+        <div class="eyebrow" style="margin-bottom:12px;">Your media database</div>
+        <h1 style="font-family:var(--font-display);font-size:2.8rem;font-weight:400;letter-spacing:-.025em;line-height:1.0;color:var(--ink);">Media List</h1>
+        <p style="font-size:.86rem;color:var(--ink-2);margin-top:12px;max-width:58ch;line-height:1.55;">Every journalist and creator you work with — searchable, with their beat, status, last touch, and the coverage they've given you. Import your spreadsheet once; it grows itself from the Newsroom and the daily brief.</p>
+      </div>
+      <div class="flex gap-2" style="flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">
+        <label class="btn btn-ghost btn-sm" style="cursor:pointer;">Import CSV<input type="file" accept=".csv" onchange="importContactsCSV(this)" style="display:none;"></label>
+        <button onclick="exportContactsCSV()" class="btn btn-ghost btn-sm">Export</button>
+        <button onclick="openContactModal()" class="btn btn-primary btn-sm">+ Add contact</button>
+      </div>
+    </div>
+  </header>
+  <div class="wrap" style="padding:8px 32px 24px;">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <div style="position:relative;flex:1;min-width:220px;">
+        <svg width="15" height="15" fill="none" stroke="var(--ink-3)" stroke-width="1.7" viewBox="0 0 24 24" style="position:absolute;left:14px;top:50%;transform:translateY(-50%);pointer-events:none;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input id="media-search" oninput="_mediaFilter.q=this.value;renderMediaList()" class="input" placeholder="Search name, outlet, beat, email…" style="padding-left:40px;" autocomplete="off">
+      </div>
+      <select id="media-status" onchange="_mediaFilter.status=this.value;renderMediaList()" class="input" style="max-width:160px;">
+        <option value="all">All statuses</option>
+        <option value="active">Active</option>
+        <option value="warm">Warm</option>
+        <option value="cold">Cold</option>
+        <option value="declined">Declined</option>
+      </select>
+    </div>
+  </div>
+  <div class="wrap" style="padding:0 32px 96px;"><div id="media-list"><div style="text-align:center;padding:80px 0;color:var(--ink-3);font-size:.86rem;">Loading your media list…</div></div></div>`;
+}
+
+async function loadMedia() { await fetchContacts(); renderMediaList(); }
+
+function renderMediaList() {
+  const el = document.getElementById('media-list'); if (!el) return;
+  const q = (_mediaFilter.q || '').toLowerCase().trim();
+  let list = _contacts.slice();
+  if (_mediaFilter.status !== 'all') list = list.filter(c => (c.status || '').toLowerCase() === _mediaFilter.status);
+  if (q) list = list.filter(c => `${c.name || ''} ${c.outlet || ''} ${(c.beat || []).join(' ')} ${c.email || ''}`.toLowerCase().includes(q));
+  list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  if (!_contacts.length) {
+    el.innerHTML = `<div style="border:1px dashed var(--rule);border-radius:var(--radius-lg);padding:72px 32px;text-align:center;">
+      <h3 style="font-family:var(--font-display);font-size:1.5rem;font-weight:400;margin-bottom:8px;">Your media list is empty</h3>
+      <p style="font-size:.86rem;color:var(--ink-2);max-width:420px;margin:0 auto 22px;line-height:1.55;">Import your existing journalist spreadsheet (CSV), or add contacts one by one. New reporters will also appear automatically from the Newsroom.</p>
+      <div class="flex gap-2" style="justify-content:center;"><label class="btn btn-primary btn-sm" style="cursor:pointer;">Import CSV<input type="file" accept=".csv" onchange="importContactsCSV(this)" style="display:none;"></label><button onclick="openContactModal()" class="btn btn-ghost btn-sm">+ Add contact</button></div>
+    </div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="eyebrow" style="margin-bottom:14px;">${list.length} contact${list.length !== 1 ? 's' : ''}${q || _mediaFilter.status !== 'all' ? ' (filtered)' : ''}</div>
+    <div style="display:flex;flex-direction:column;border:1px solid var(--rule);border-radius:var(--radius-lg);overflow:hidden;background:var(--surface);">
+      ${list.map((c, i) => contactRow(c, i < list.length - 1)).join('')}
+    </div>`;
+}
+
+function contactRow(c, border) {
+  const dom = c.outletDomain || extractDomain(c.outlet || '');
+  const logo = dom ? outletLogoUrl(dom) : '';
+  const beats = (c.beat || []).slice(0, 3).map(b => `<span style="font-size:.62rem;color:var(--ink-3);background:var(--paper-2);border:1px solid var(--rule);border-radius:100px;padding:1px 8px;">${esc(b)}</span>`).join('');
+  const lt = c.lastTouch || c.lastSeen || '';
+  return `
+  <div onclick="contactProfile('${c.id}')" style="cursor:pointer;padding:15px 20px;display:flex;align-items:center;gap:14px;${border ? 'border-bottom:1px solid var(--rule);' : ''}transition:background var(--t-fast) var(--ease);" onmouseover="this.style.background='var(--paper-2)'" onmouseout="this.style.background=''">
+    ${logo ? `<img src="${logo}" style="width:20px;height:20px;border-radius:5px;flex-shrink:0;" onerror="this.style.display='none'" alt="">` : `<span style="width:20px;height:20px;flex-shrink:0;"></span>`}
+    <div style="min-width:0;flex:1;">
+      <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;">
+        <span style="font-size:.9rem;font-weight:600;color:var(--ink);">${esc(c.name || 'Unknown')}</span>
+        ${statusChip(c.status)}
+        ${c.da ? `<span class="da-pill ${daClass(c.da)}"><span class="da-prefix">DA</span>${c.da}</span>` : ''}
+        ${c.type === 'influencer' ? `<span style="font-size:.58rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#7c3aed;">Creator</span>` : ''}
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-top:4px;flex-wrap:wrap;">
+        <span style="font-size:.74rem;color:var(--ink-2);">${esc(c.outlet || dom || '—')}</span>
+        ${beats ? `<span style="color:var(--rule);">·</span>${beats}` : ''}
+        ${(c.articles || []).length ? `<span style="color:var(--rule);">·</span><span style="font-size:.7rem;color:var(--ink-3);">${c.articles.length} article${c.articles.length !== 1 ? 's' : ''}</span>` : ''}
+      </div>
+    </div>
+    <div style="text-align:right;flex-shrink:0;">
+      ${lt ? `<div style="font-size:.7rem;color:${isStale(c) ? 'var(--red)' : 'var(--ink-3)'};">${isStale(c) ? 'Stale · ' : ''}${fmtDateShort(String(lt).slice(0, 10))}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+function contactProfile(id) {
+  const c = _contacts.find(x => x.id === id); if (!c) return;
+  const dom = c.outletDomain || extractDomain(c.outlet || '');
+  const logo = dom ? outletLogoUrl(dom) : '';
+  const clients = contactClientNames(c);
+  const arts = (c.articles || []).slice(0, 12);
+  openModal(`
+  <div style="padding:34px;">
+    <div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:18px;">
+      ${logo ? `<img src="${logo}" style="width:40px;height:40px;border-radius:8px;flex-shrink:0;" onerror="this.style.display='none'" alt="">` : ''}
+      <div style="min-width:0;flex:1;">
+        <h2 style="font-family:var(--font-display);font-size:1.7rem;font-weight:400;letter-spacing:-.02em;line-height:1.1;">${esc(c.name || 'Unknown')}</h2>
+        <div style="display:flex;align-items:center;gap:9px;margin-top:6px;flex-wrap:wrap;">
+          <span style="font-size:.82rem;color:var(--ink-2);">${esc(c.outlet || dom || '')}</span>
+          ${statusChip(c.status)}${c.da ? `<span class="da-pill ${daClass(c.da)}"><span class="da-prefix">DA</span>${c.da}</span>` : ''}
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:11px;font-size:.84rem;color:var(--ink-2);">
+      ${c.email ? `<div><span class="eyebrow">Email</span><br><a href="mailto:${esc(c.email)}" style="color:var(--ink);text-decoration:underline;text-decoration-color:var(--rule);text-underline-offset:3px;">${esc(c.email)}</a></div>` : ''}
+      ${(c.beat || []).length ? `<div><span class="eyebrow">Beat</span><br>${(c.beat || []).map(esc).join(', ')}</div>` : ''}
+      ${clients.length ? `<div><span class="eyebrow">Clients</span><br>${clients.map(esc).join(', ')}</div>` : ''}
+      ${(c.lastTouch || c.lastSeen) ? `<div><span class="eyebrow">Last touch</span><br>${fmtDateShort(String(c.lastTouch || c.lastSeen).slice(0, 10))}${isStale(c) ? ' <span style="color:var(--red);font-weight:600;">· overdue</span>' : ''}</div>` : ''}
+      ${c.notes ? `<div><span class="eyebrow">Notes</span><br>${esc(c.notes)}</div>` : ''}
+      ${arts.length ? `<div><span class="eyebrow">Recent coverage (${(c.articles || []).length})</span><div style="display:flex;flex-direction:column;gap:7px;margin-top:8px;">${arts.map(a => `<a href="${esc(a.url)}" target="_blank" rel="noopener" style="font-size:.8rem;color:var(--ink);text-decoration:none;border-left:2px solid var(--rule);padding-left:10px;line-height:1.3;">${esc(a.title || a.url)}${a.date ? `<span style="color:var(--ink-3);font-size:.7rem;"> · ${fmtDateShort(a.date)}</span>` : ''}</a>`).join('')}</div></div>` : ''}
+      <div id="cp-pitches"></div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:24px;padding-top:20px;border-top:1px solid var(--rule);">
+      <button onclick="confirmDeleteContact('${c.id}')" class="btn btn-ghost" style="flex:0 0 auto;color:var(--red);">Delete</button>
+      <button onclick="openPitchModal(null,'${c.id}')" class="btn btn-ghost" style="flex:0 0 auto;">New pitch</button>
+      <button onclick="closeModal()" class="btn btn-ghost" style="flex:1;">Close</button>
+      <button onclick="openContactModal('${c.id}')" class="btn btn-primary" style="flex:1;">Edit</button>
+    </div>
+  </div>`);
+  setTimeout(() => fillContactPitches(id), 0);
+}
+async function fillContactPitches(id) {
+  let el = document.getElementById('cp-pitches'); if (!el) return;
+  if (!_pitches.length) { try { await fetchPitches(); } catch {} }
+  el = document.getElementById('cp-pitches'); if (!el) return;
+  const ps = _pitches.filter(p => (p.contactIds || []).includes(id));
+  if (!ps.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div><span class="eyebrow">Pitches (${ps.length})</span><div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">${ps.map(p => `<div onclick="closeModal();openPitchModal('${p.id}')" style="cursor:pointer;font-size:.8rem;color:var(--ink);display:flex;align-items:center;gap:8px;border-left:2px solid var(--rule);padding-left:10px;line-height:1.3;">${pitchStatusChip(p.status)}<span class="truncate">${esc(p.angle || p.subject || 'Pitch')}</span></div>`).join('')}</div></div>`;
+}
+
+function openContactModal(id) {
+  const c = id ? _contacts.find(x => x.id === id) : null;
+  openModal(`
+  <div style="padding:34px;">
+    <div class="eyebrow" style="margin-bottom:10px;">${c ? 'Edit contact' : 'Add contact'}</div>
+    <h2 style="font-family:var(--font-display);font-size:1.6rem;font-weight:400;letter-spacing:-.02em;margin-bottom:20px;">${c ? esc(c.name) : 'New media contact'}</h2>
+    <div style="display:flex;flex-direction:column;gap:14px;max-height:60vh;overflow-y:auto;padding-right:4px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><label class="field-label">Name</label><input id="ct-name" class="input" value="${c ? esc(c.name || '') : ''}"></div>
+        <div><label class="field-label">Outlet</label><input id="ct-outlet" class="input" value="${c ? esc(c.outlet || '') : ''}"></div>
+      </div>
+      <div><label class="field-label">Email</label><input id="ct-email" class="input" value="${c ? esc(c.email || '') : ''}" placeholder="name@outlet.com"></div>
+      <div><label class="field-label">Beat <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;color:var(--ink-3);">— comma-separated</span></label><input id="ct-beat" class="input" value="${c ? esc((c.beat || []).join(', ')) : ''}" placeholder="food, lifestyle, pets"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+        <div><label class="field-label">Status</label><select id="ct-status" class="input">${['', 'active', 'warm', 'cold', 'declined'].map(s => `<option value="${s}"${c && (c.status || '') === s ? ' selected' : ''}>${s ? s[0].toUpperCase() + s.slice(1) : '—'}</option>`).join('')}</select></div>
+        <div><label class="field-label">Type</label><select id="ct-type" class="input">${['journalist', 'influencer'].map(t => `<option value="${t}"${c && (c.type || 'journalist') === t ? ' selected' : ''}>${t[0].toUpperCase() + t.slice(1)}</option>`).join('')}</select></div>
+        <div><label class="field-label">Tier</label><input id="ct-tier" class="input" value="${c ? esc(c.tier || '') : ''}" placeholder="1"></div>
+      </div>
+      <div><label class="field-label">Clients <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;color:var(--ink-3);">— who they cover for you</span></label>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;">${books.map(b => `<label style="display:inline-flex;align-items:center;gap:6px;font-size:.8rem;color:var(--ink-2);cursor:pointer;"><input type="checkbox" class="ct-client" value="${b.id}"${c && (c.clients || []).includes(b.id) ? ' checked' : ''}> ${esc(b.client || b.name)}</label>`).join('') || '<span style="font-size:.78rem;color:var(--ink-3);">No books yet</span>'}</div>
+      </div>
+      <div><label class="field-label">Notes</label><textarea id="ct-notes" class="input" rows="2" style="resize:vertical;font-family:inherit;">${c ? esc(c.notes || '') : ''}</textarea></div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:22px;padding-top:20px;border-top:1px solid var(--rule);">
+      <button onclick="closeModal()" class="btn btn-ghost" style="flex:1;">Cancel</button>
+      <button onclick="saveContactForm(${c ? `'${c.id}'` : 'null'})" class="btn btn-primary" style="flex:1;">Save</button>
+    </div>
+  </div>`);
+  setTimeout(() => document.getElementById('ct-name')?.focus(), 50);
+}
+
+async function saveContactForm(id) {
+  const name = document.getElementById('ct-name')?.value?.trim();
+  if (!name) { toast('Name is required'); return; }
+  const rec = {
+    name, outlet: document.getElementById('ct-outlet')?.value?.trim() || '',
+    email: document.getElementById('ct-email')?.value?.trim() || '',
+    beat: (document.getElementById('ct-beat')?.value || '').split(',').map(s => s.trim()).filter(Boolean),
+    status: document.getElementById('ct-status')?.value || '',
+    type: document.getElementById('ct-type')?.value || 'journalist',
+    tier: document.getElementById('ct-tier')?.value?.trim() || '',
+    notes: document.getElementById('ct-notes')?.value?.trim() || '',
+    clients: Array.from(document.querySelectorAll('.ct-client:checked')).map(el => el.value),
+    source: 'manual',
+  };
+  if (id) rec.id = id;
+  await upsertContacts([rec]);
+  closeModal(); await loadMedia(); toast('Contact saved');
+}
+
+function confirmDeleteContact(id) {
+  const c = _contacts.find(x => x.id === id);
+  confirmAction('Delete contact?', `Remove ${c ? c.name : 'this contact'} from your media list.`, async () => { await deleteContactById(id); closeModal(); await loadMedia(); toast('Contact deleted'); });
+}
+
+// Forgiving CSV parse (handles quoted fields) + flexible header mapping.
+function _parseCsvLine(line) {
+  const out = []; let cur = '', q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++; } else q = false; } else cur += ch; }
+    else { if (ch === '"') q = true; else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch; }
+  }
+  out.push(cur); return out.map(s => s.trim());
+}
+function importContactsCSV(input) {
+  const file = input.files && input.files[0]; if (!file) return;
+  const reader = new FileReader();
+  reader.onload = async e => {
+    const lines = String(e.target.result).split(/\r?\n/).filter(l => l.trim().length);
+    if (lines.length < 2) { toast('CSV looks empty'); return; }
+    const headers = _parseCsvLine(lines[0]).map(h => h.toLowerCase());
+    const find = names => headers.findIndex(h => names.some(n => h.includes(n)));
+    const iN = find(['name', 'journalist', 'reporter', 'contact']), iO = find(['outlet', 'publication', 'media', 'company']), iE = find(['email', 'e-mail']), iB = find(['beat', 'topic', 'section', 'category']), iS = find(['status']), iT = find(['tier']), iNo = find(['note', 'remark']);
+    const arr = [];
+    for (let r = 1; r < lines.length; r++) {
+      const row = _parseCsvLine(lines[r]);
+      const nm = iN >= 0 ? (row[iN] || '').trim() : (row[0] || '').trim();
+      if (!nm) continue;
+      arr.push({ name: nm, outlet: iO >= 0 ? (row[iO] || '').trim() : '', email: iE >= 0 ? (row[iE] || '').trim() : '', beat: iB >= 0 ? (row[iB] || '').split(/[;,/|]/).map(s => s.trim()).filter(Boolean) : [], status: iS >= 0 ? (row[iS] || '').trim().toLowerCase() : '', tier: iT >= 0 ? (row[iT] || '').trim() : '', notes: iNo >= 0 ? (row[iNo] || '').trim() : '', source: 'csv' });
+    }
+    if (!arr.length) { toast('No rows with a name found'); return; }
+    await upsertContacts(arr); await loadMedia();
+    toast(`Imported ${arr.length} contact${arr.length !== 1 ? 's' : ''}`);
+  };
+  reader.readAsText(file);
+}
+function exportContactsCSV() {
+  if (!_contacts.length) { toast('No contacts to export'); return; }
+  const esc2 = s => `"${String(s == null ? '' : s).replace(/"/g, '""')}"`;
+  const head = ['Name', 'Outlet', 'Email', 'Beat', 'Status', 'Tier', 'Type', 'Last touch', 'Notes'];
+  const rows = _contacts.map(c => [c.name, c.outlet, c.email, (c.beat || []).join('; '), c.status, c.tier, c.type, c.lastTouch || c.lastSeen || '', c.notes].map(esc2).join(','));
+  const blob = new Blob([head.map(esc2).join(',') + '\n' + rows.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'media-list.csv'; a.click();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAGE: PITCHES — angle → journalist → status pipeline (shared)
+// ═══════════════════════════════════════════════════════════════════
+let _pitches = [];
+let _pitchFilter = { status: 'all', clientId: 'all' };
+let _pitchDraftTargets = [];
+const PITCH_STATUSES = ['draft', 'sent', 'replied', 'landed', 'killed'];
+function _saveLocalPitches() { try { localStorage.setItem('clippings_pitches', JSON.stringify(_pitches)); } catch {} }
+function _readLocalPitches() { try { return JSON.parse(localStorage.getItem('clippings_pitches') || '[]'); } catch { return []; } }
+async function fetchPitches() {
+  const base = backendBase();
+  if (base) {
+    try {
+      const r = await fetch(`${base}/api/pitches`, { headers: apiHeaders() });
+      const j = await r.json(); const remote = j.pitches || []; const local = _readLocalPitches();
+      if (!remote.length && local.length) {
+        try { await fetch(`${base}/api/pitches`, { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ pitches: local }) }); } catch {}
+        _pitches = local; return _pitches;
+      }
+      _pitches = remote; _saveLocalPitches(); return _pitches;
+    } catch {}
+  }
+  _pitches = _readLocalPitches(); return _pitches;
+}
+async function upsertPitches(arr) {
+  for (const p of arr) {
+    let ex = p.id ? _pitches.find(x => x.id === p.id) : null;
+    if (ex) Object.assign(ex, p, { updatedAt: Date.now() });
+    else { p.id = p.id || ('p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)); p.createdAt = p.createdAt || Date.now(); p.updatedAt = Date.now(); if (p.status === 'sent' && !p.sentAt) p.sentAt = new Date().toISOString(); _pitches.push(p); }
+  }
+  _saveLocalPitches();
+  const base = backendBase();
+  if (base) { try { await fetch(`${base}/api/pitches`, { method: 'POST', headers: apiHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ pitches: arr }) }); } catch {} }
+}
+async function deletePitchById(id) {
+  _pitches = _pitches.filter(x => x.id !== id); _saveLocalPitches();
+  const base = backendBase();
+  if (base) { try { await fetch(`${base}/api/pitches/${id}`, { method: 'DELETE', headers: apiHeaders() }); } catch {} }
+}
+function pitchClientName(p) { const b = books.find(x => x.id === p.clientId); return b ? (b.client || b.name) : ''; }
+function pitchContacts(p) { return (p.contactIds || []).map(id => _contacts.find(c => c.id === id)).filter(Boolean); }
+function pitchStatusChip(s) {
+  const map = { draft: { t: 'Draft', c: 'var(--ink-3)', bg: 'var(--paper-2)' }, sent: { t: 'Sent', c: 'var(--ink)', bg: 'var(--paper-2)' }, replied: { t: 'Replied', c: '#b8860b', bg: '#b8860b14' }, landed: { t: 'Landed', c: '#2d7a4a', bg: '#2d7a4a14' }, killed: { t: 'Killed', c: 'var(--red)', bg: 'var(--paper-2)' } };
+  const v = map[(s || 'draft').toLowerCase()] || map.draft;
+  return `<span style="font-family:var(--font-mono);font-size:.58rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:${v.c};background:${v.bg};border-radius:100px;padding:2px 9px;">${v.t}</span>`;
+}
+
+// Who-should-we-pitch scoring: client link + coverage history + relationship + recency + outlet DA.
+function recommendContacts(clientId, n = 6) {
+  const now = Date.now();
+  const scored = _contacts.map(c => {
+    let s = 0;
+    if (clientId && (c.clients || []).includes(clientId)) s += 5;
+    const artForClient = (c.articles || []).filter(a => a.clientId === clientId).length;
+    s += Math.min(artForClient, 3) * 2;
+    const st = (c.status || '').toLowerCase();
+    s += st === 'active' ? 3 : st === 'warm' ? 2 : 0;
+    const lt = Date.parse(c.lastTouch || c.lastSeen || ((c.articles || [])[0] || {}).date || '');
+    if (!isNaN(lt)) { const days = (now - lt) / 86400000; s += days <= 30 ? 2 : days <= 90 ? 1 : 0; }
+    if (c.da >= 60) s += 2; else if (c.da >= 40) s += 1;
+    return { c, s };
+  });
+  scored.sort((a, b) => b.s - a.s);
+  const top = scored.filter(x => x.s > 0).slice(0, n).map(x => x.c);
+  return top.length ? top : _contacts.slice(0, n);
+}
+
+function pagePitches() {
+  setTimeout(loadPitches, 0);
+  return `
+  ${topNav('pitches')}
+  <header class="wrap" style="padding:64px 32px 20px;">
+    <div class="flex-between" style="align-items:flex-end;gap:24px;">
+      <div style="min-width:0;">
+        <div class="eyebrow" style="margin-bottom:12px;">Outreach pipeline</div>
+        <h1 style="font-family:var(--font-display);font-size:2.8rem;font-weight:400;letter-spacing:-.025em;line-height:1.0;color:var(--ink);">Pitches</h1>
+        <p style="font-size:.86rem;color:var(--ink-2);margin-top:12px;max-width:58ch;line-height:1.55;">Track every pitch from draft to landed. Draft the angle here or with the daily brief, pick the right journalists, and watch what converts.</p>
+      </div>
+      <button onclick="openPitchModal()" class="btn btn-primary btn-sm" style="flex-shrink:0;">+ New pitch</button>
+    </div>
+  </header>
+  <div class="wrap" style="padding:6px 32px 20px;">
+    <div id="pitch-stats" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;"></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+      <select id="pitch-status-f" onchange="_pitchFilter.status=this.value;renderPitchList()" class="input" style="max-width:160px;">
+        <option value="all">All statuses</option>${PITCH_STATUSES.map(s => `<option value="${s}">${s[0].toUpperCase() + s.slice(1)}</option>`).join('')}
+      </select>
+      <select id="pitch-client-f" onchange="_pitchFilter.clientId=this.value;renderPitchList()" class="input" style="max-width:200px;">
+        <option value="all">All clients</option>${books.map(b => `<option value="${b.id}">${esc(b.client || b.name)}</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  <div class="wrap" style="padding:0 32px 96px;"><div id="pitch-list"><div style="text-align:center;padding:80px 0;color:var(--ink-3);font-size:.86rem;">Loading pitches…</div></div></div>`;
+}
+async function loadPitches() { await Promise.all([fetchPitches(), fetchContacts()]); renderPitchList(); }
+function renderPitchList() {
+  const el = document.getElementById('pitch-list'); if (!el) return;
+  const stats = document.getElementById('pitch-stats');
+  if (stats) {
+    const counts = {}; PITCH_STATUSES.forEach(s => counts[s] = 0);
+    _pitches.forEach(p => { counts[(p.status || 'draft')] = (counts[(p.status || 'draft')] || 0) + 1; });
+    stats.innerHTML = PITCH_STATUSES.map(s => `<div style="border:1px solid var(--rule);border-radius:var(--radius);padding:8px 14px;background:var(--surface);"><div class="mono" style="font-size:1.1rem;font-weight:600;color:var(--ink);">${counts[s] || 0}</div><div style="font-size:.6rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--ink-3);margin-top:2px;">${s}</div></div>`).join('');
+  }
+  let list = _pitches.slice();
+  if (_pitchFilter.status !== 'all') list = list.filter(p => (p.status || 'draft') === _pitchFilter.status);
+  if (_pitchFilter.clientId !== 'all') list = list.filter(p => p.clientId === _pitchFilter.clientId);
+  list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  if (!_pitches.length) {
+    el.innerHTML = `<div style="border:1px dashed var(--rule);border-radius:var(--radius-lg);padding:72px 32px;text-align:center;">
+      <h3 style="font-family:var(--font-display);font-size:1.5rem;font-weight:400;margin-bottom:8px;">No pitches yet</h3>
+      <p style="font-size:.86rem;color:var(--ink-2);max-width:420px;margin:0 auto 22px;line-height:1.55;">Create a pitch, pick the journalists (we'll suggest the best fits), and track it from draft to landed coverage.</p>
+      <button onclick="openPitchModal()" class="btn btn-primary btn-sm">+ New pitch</button>
+    </div>`; return;
+  }
+  el.innerHTML = `<div class="eyebrow" style="margin-bottom:14px;">${list.length} pitch${list.length !== 1 ? 'es' : ''}${_pitchFilter.status !== 'all' || _pitchFilter.clientId !== 'all' ? ' (filtered)' : ''}</div>
+    <div style="display:flex;flex-direction:column;border:1px solid var(--rule);border-radius:var(--radius-lg);overflow:hidden;background:var(--surface);">${list.map((p, i) => pitchRow(p, i < list.length - 1)).join('')}</div>`;
+}
+function pitchRow(p, border) {
+  const cl = pitchClientName(p); const cts = pitchContacts(p);
+  const names = cts.map(c => esc(c.name)).join(', ') || '<span style="color:var(--ink-3);">no targets yet</span>';
+  const accent = (books.find(b => b.id === p.clientId) || {}).accentColor || 'var(--ink-3)';
+  return `<div onclick="openPitchModal('${p.id}')" style="cursor:pointer;padding:15px 20px;display:flex;align-items:center;gap:14px;${border ? 'border-bottom:1px solid var(--rule);' : ''}transition:background var(--t-fast) var(--ease);" onmouseover="this.style.background='var(--paper-2)'" onmouseout="this.style.background=''">
+    <div style="flex:1;min-width:0;">
+      <div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;">${pitchStatusChip(p.status)}${cl ? `<span style="display:inline-flex;align-items:center;gap:6px;font-size:.64rem;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:${accent};"><span style="width:6px;height:6px;border-radius:6px;background:${accent};"></span>${esc(cl)}</span>` : ''}</div>
+      <div style="font-size:.9rem;font-weight:600;color:var(--ink);margin-top:5px;" class="truncate">${esc(p.angle || p.subject || 'Untitled pitch')}</div>
+      <div style="font-size:.72rem;color:var(--ink-3);margin-top:3px;" class="truncate">→ ${names}</div>
+    </div>
+    <div style="font-size:.7rem;color:var(--ink-3);flex-shrink:0;">${p.updatedAt ? fmtDateShort(new Date(p.updatedAt).toISOString().slice(0, 10)) : ''}</div>
+  </div>`;
+}
+
+function openPitchModal(id, prefillContactId) {
+  const p = id ? _pitches.find(x => x.id === id) : null;
+  _pitchDraftTargets = p ? (p.contactIds || []).slice() : (prefillContactId ? [prefillContactId] : []);
+  openModal(`
+  <div style="padding:34px;">
+    <div class="eyebrow" style="margin-bottom:10px;">${p ? 'Edit pitch' : 'New pitch'}</div>
+    <h2 style="font-family:var(--font-display);font-size:1.6rem;font-weight:400;letter-spacing:-.02em;margin-bottom:20px;">${p ? esc(p.angle || p.subject || 'Pitch') : 'Draft a pitch'}</h2>
+    <div style="display:flex;flex-direction:column;gap:14px;max-height:62vh;overflow-y:auto;padding-right:4px;">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><label class="field-label">Client</label><select id="pt-client" class="input" onchange="updatePitchSuggestions()"><option value="">—</option>${books.map(b => `<option value="${b.id}"${p && p.clientId === b.id ? ' selected' : ''}>${esc(b.client || b.name)}</option>`).join('')}</select></div>
+        <div><label class="field-label">Status</label><select id="pt-status" class="input">${PITCH_STATUSES.map(s => `<option value="${s}"${(p ? (p.status || 'draft') : 'draft') === s ? ' selected' : ''}>${s[0].toUpperCase() + s.slice(1)}</option>`).join('')}</select></div>
+      </div>
+      <div><label class="field-label">Angle</label><input id="pt-angle" class="input" value="${p ? esc(p.angle || '') : ''}" placeholder="The hook in one line"></div>
+      <div><label class="field-label">Subject line</label><input id="pt-subject" class="input" value="${p ? esc(p.subject || '') : ''}" placeholder="What the email subject would be"></div>
+      <div><label class="field-label">Pitch body <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;color:var(--ink-3);">— paste from the brief or draft here</span></label><textarea id="pt-body" class="input" rows="5" style="resize:vertical;font-family:inherit;line-height:1.5;">${p ? esc(p.body || '') : ''}</textarea></div>
+      <div>
+        <label class="field-label">Target journalists</label>
+        <div id="pt-targets" style="display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 8px;"></div>
+        <input id="pt-search" class="input" placeholder="Search your media list to add…" oninput="renderPitchSearch()" autocomplete="off">
+        <div id="pt-search-results" style="margin-top:6px;"></div>
+        <div style="margin-top:10px;"><span class="eyebrow">Suggested</span><div id="pt-suggest" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;"></div></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:22px;padding-top:20px;border-top:1px solid var(--rule);">
+      ${p ? `<button onclick="confirmDeletePitch('${p.id}')" class="btn btn-ghost" style="flex:0 0 auto;color:var(--red);">Delete</button>` : ''}
+      <button onclick="emailPitchDraft()" class="btn btn-ghost" style="flex:0 0 auto;" title="Open Gmail with this pitch to the selected journalists">Email</button>
+      <button onclick="closeModal()" class="btn btn-ghost" style="flex:1;">Cancel</button>
+      <button onclick="savePitchForm(${p ? `'${p.id}'` : 'null'})" class="btn btn-primary" style="flex:1;">Save</button>
+    </div>
+  </div>`);
+  renderPitchTargets(); updatePitchSuggestions();
+}
+function _contactChip(c, kind) {
+  const dom = c.outletDomain || extractDomain(c.outlet || '');
+  return `<button onclick="togglePitchTarget('${c.id}')" class="btn btn-ghost btn-sm" style="padding:4px 10px;font-size:.74rem;${kind === 'on' ? 'border-color:var(--ink);color:var(--ink);' : 'color:var(--ink-2);'}">${kind === 'on' ? '✓ ' : '+ '}${esc(c.name)}${c.outlet ? ` · <span style="color:var(--ink-3);">${esc(c.outlet)}</span>` : ''}</button>`;
+}
+function togglePitchTarget(cid) {
+  const i = _pitchDraftTargets.indexOf(cid);
+  if (i >= 0) _pitchDraftTargets.splice(i, 1); else _pitchDraftTargets.push(cid);
+  renderPitchTargets(); updatePitchSuggestions(); renderPitchSearch();
+}
+function renderPitchTargets() {
+  const el = document.getElementById('pt-targets'); if (!el) return;
+  if (!_pitchDraftTargets.length) { el.innerHTML = `<span style="font-size:.76rem;color:var(--ink-3);">No journalists picked yet — add from search or suggestions.</span>`; return; }
+  el.innerHTML = _pitchDraftTargets.map(id => { const c = _contacts.find(x => x.id === id); return c ? _contactChip(c, 'on') : ''; }).join('');
+}
+function updatePitchSuggestions() {
+  const el = document.getElementById('pt-suggest'); if (!el) return;
+  const clientId = document.getElementById('pt-client')?.value || '';
+  const recs = recommendContacts(clientId, 6).filter(c => !_pitchDraftTargets.includes(c.id));
+  el.innerHTML = recs.length ? recs.map(c => _contactChip(c, 'off')).join('') : `<span style="font-size:.74rem;color:var(--ink-3);">Add contacts to your Media List to get suggestions.</span>`;
+}
+function renderPitchSearch() {
+  const el = document.getElementById('pt-search-results'); if (!el) return;
+  const q = (document.getElementById('pt-search')?.value || '').toLowerCase().trim();
+  if (!q) { el.innerHTML = ''; return; }
+  const hits = _contacts.filter(c => !_pitchDraftTargets.includes(c.id) && `${c.name || ''} ${c.outlet || ''} ${(c.beat || []).join(' ')}`.toLowerCase().includes(q)).slice(0, 8);
+  el.innerHTML = hits.length ? `<div style="display:flex;flex-wrap:wrap;gap:6px;">${hits.map(c => _contactChip(c, 'off')).join('')}</div>` : `<span style="font-size:.74rem;color:var(--ink-3);">No match — <button onclick="closeModal();go('media');setTimeout(openContactModal,300)" style="color:var(--ink);text-decoration:underline;">add them to your Media List</button> first.</span>`;
+}
+async function savePitchForm(id) {
+  const angle = document.getElementById('pt-angle')?.value?.trim() || '';
+  const subject = document.getElementById('pt-subject')?.value?.trim() || '';
+  if (!angle && !subject) { toast('Add an angle or a subject line'); return; }
+  const rec = {
+    clientId: document.getElementById('pt-client')?.value || '',
+    angle, subject,
+    body: document.getElementById('pt-body')?.value || '',
+    status: document.getElementById('pt-status')?.value || 'draft',
+    contactIds: _pitchDraftTargets.slice(),
+  };
+  if (id) rec.id = id;
+  await upsertPitches([rec]);
+  closeModal(); await loadPitches(); toast('Pitch saved');
+}
+function confirmDeletePitch(id) {
+  confirmAction('Delete pitch?', 'This removes it from the pipeline.', async () => { await deletePitchById(id); closeModal(); await loadPitches(); toast('Pitch deleted'); });
+}
+// Open Gmail compose pre-filled with the pitch, addressed to the selected journalists.
+function emailPitchDraft() {
+  const subject = document.getElementById('pt-subject')?.value || '';
+  const body = document.getElementById('pt-body')?.value || '';
+  const emails = _pitchDraftTargets.map(id => (_contacts.find(c => c.id === id) || {}).email).filter(Boolean);
+  if (!emails.length) { toast('Add a target journalist who has an email first'); return; }
+  const url = 'https://mail.google.com/mail/?view=cm&fs=1&to=' + encodeURIComponent(emails.join(',')) + '&su=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(body);
+  window.open(url, '_blank', 'noopener');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAGE: NEWSROOM — live news crawl across all clients (shared)
+// ═══════════════════════════════════════════════════════════════════
+function pageNewsroom() {
+  setTimeout(loadNewsroom, 0);
+  return `
+  ${topNav('newsroom')}
+  <header class="wrap" style="padding:64px 32px 28px;">
+    <div class="flex-between" style="align-items:flex-end;border-bottom:1px solid var(--rule);padding-bottom:24px;gap:24px;">
+      <div style="min-width:0;">
+        <div class="eyebrow" style="margin-bottom:12px;">Live news crawl</div>
+        <h1 style="font-family:var(--font-display);font-size:2.8rem;font-weight:400;letter-spacing:-.025em;line-height:1.0;color:var(--ink);">Newsroom</h1>
+        <p style="font-size:.86rem;color:var(--ink-2);margin-top:12px;max-width:56ch;line-height:1.55;">Every mention our monitors have found across all clients — newest first. Add keywords from any project's <strong>Monitor</strong> tab.</p>
+      </div>
+      <button onclick="sweepNewsroom(this)" class="btn btn-ghost btn-sm" style="flex-shrink:0;">
+        <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Check now
+      </button>
+    </div>
+  </header>
+  <div class="wrap" style="padding:28px 32px 96px;">
+    <div id="newsroom-feed"><div style="text-align:center;padding:80px 0;color:var(--ink-3);font-size:.86rem;">Loading the latest coverage…</div></div>
+  </div>`;
+}
+
+async function loadNewsroom() {
+  const el = document.getElementById('newsroom-feed');
+  if (!el) return;
+  const base = backendBase();
+  if (!base) { el.innerHTML = newsroomEmpty('Connect a backend to see the live news crawl.'); return; }
+  try {
+    const r = await fetch(`${base}/api/mentions`, { headers: apiHeaders() });
+    const j = await r.json();
+    const items = (j.mentions || []).slice().sort((a, b) => Date.parse(b.foundAt || b.date || 0) - Date.parse(a.foundAt || a.date || 0));
+    if (!items.length) { el.innerHTML = newsroomEmpty('No mentions yet. Add keywords in a project\'s Monitor tab, then click “Check now”.'); return; }
+    el.innerHTML = `
+      <div class="eyebrow" style="margin-bottom:16px;">${items.length} mention${items.length !== 1 ? 's' : ''} · all clients</div>
+      <div style="display:flex;flex-direction:column;gap:10px;">${items.map(m => newsroomRow(m)).join('')}</div>`;
+  } catch { el.innerHTML = newsroomEmpty('Could not reach the backend.'); }
+}
+
+function newsroomRow(m) {
+  const dom = extractDomain(m.sourceUrl || m.url || '');
+  const logo = dom ? outletLogoUrl(dom) : '';
+  const b = books.find(x => x.id === m.clientId);
+  const accent = (b && b.accentColor) || '#2d5f3d';
+  const client = m.clientName || (b && (b.client || b.name)) || '';
+  return `
+  <a href="${esc(m.url)}" target="_blank" rel="noopener" style="text-decoration:none;border:1px solid var(--rule);border-radius:var(--radius-lg);padding:16px 20px;background:var(--surface);display:flex;align-items:center;gap:16px;transition:border-color var(--t) var(--ease);"
+    onmouseover="this.style.borderColor='#d4d0ca'" onmouseout="this.style.borderColor='var(--rule)'">
+    ${logo ? `<img src="${logo}" style="width:22px;height:22px;border-radius:5px;flex-shrink:0;" onerror="this.style.display='none'" alt="">` : ''}
+    <div style="min-width:0;flex:1;">
+      <div style="font-size:.92rem;font-weight:500;color:var(--ink);line-height:1.3;" class="line-clamp-2">${esc(m.title || 'Untitled')}</div>
+      <div style="display:flex;align-items:center;gap:9px;margin-top:6px;flex-wrap:wrap;">
+        ${client ? `<span style="display:inline-flex;align-items:center;gap:6px;font-size:.66rem;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:${accent};"><span style="width:6px;height:6px;border-radius:6px;background:${accent};"></span>${esc(client)}</span><span style="width:3px;height:3px;border-radius:3px;background:var(--rule);"></span>` : ''}
+        <span style="font-size:.72rem;color:var(--ink-3);">${esc(m.outlet || dom)}</span>
+        ${m.date ? `<span style="width:3px;height:3px;border-radius:3px;background:var(--rule);"></span><span style="font-size:.72rem;color:var(--ink-3);">${fmtDateShort(m.date)}</span>` : ''}
+        ${m.keyword ? `<span style="font-size:.62rem;color:var(--ink-3);background:var(--paper-2);border:1px solid var(--rule);border-radius:100px;padding:1px 8px;">"${esc(m.keyword)}"</span>` : ''}
+      </div>
+    </div>
+    <svg width="14" height="14" fill="none" stroke="var(--ink-3)" stroke-width="1.6" viewBox="0 0 24 24" style="flex-shrink:0;"><path d="M7 17l10-10M7 7h10v10"/></svg>
+  </a>`;
+}
+
+function newsroomEmpty(msg) {
+  return `<div style="border:1px dashed var(--rule);border-radius:var(--radius-lg);padding:64px 32px;text-align:center;">
+    <div style="width:48px;height:48px;border-radius:50%;background:var(--paper-2);margin:0 auto 16px;display:grid;place-items:center;">
+      <svg width="20" height="20" fill="none" stroke="var(--ink-3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+    </div>
+    <p style="font-size:.86rem;color:var(--ink-2);max-width:400px;margin:0 auto;line-height:1.55;">${esc(msg)}</p>
+  </div>`;
+}
+
+async function sweepNewsroom(btn) {
+  const base = backendBase();
+  if (!base) { toast('Connect a backend first'); return; }
+  if (btn) { btn.disabled = true; btn.style.opacity = '.6'; }
+  toast('Checking the news…');
+  try {
+    await fetch(`${base}/api/sweep`, { method: 'POST', headers: apiHeaders() });
+    await loadNewsroom();
+    toast('Newsroom updated');
+  } catch { toast('Could not reach the backend.'); }
+  if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PAGE: DAILY INTEL — the PR brief piped in from the Cowork task (shared)
+// ═══════════════════════════════════════════════════════════════════
+let _intelData = { latest: null, history: [] };
+function pageIntel() {
+  setTimeout(loadIntel, 0);
+  return `
+  ${topNav('intel')}
+  <header class="wrap" style="padding:64px 32px 28px;">
+    <div style="border-bottom:1px solid var(--rule);padding-bottom:24px;">
+      <div class="eyebrow" style="margin-bottom:12px;">Daily PR intelligence</div>
+      <h1 style="font-family:var(--font-display);font-size:2.8rem;font-weight:400;letter-spacing:-.025em;line-height:1.0;color:var(--ink);">Daily Intel</h1>
+      <p style="font-size:.86rem;color:var(--ink-2);margin-top:12px;max-width:62ch;line-height:1.55;">Your morning PR intelligence brief — opportunities, competitor moves, journalist bylines, and pitch windows. Posted automatically each day.</p>
+    </div>
+  </header>
+  <div class="wrap" style="padding:28px 32px 96px;">
+    <div id="intel-body"><div style="text-align:center;padding:80px 0;color:var(--ink-3);font-size:.86rem;">Loading today's brief…</div></div>
+  </div>`;
+}
+
+async function loadIntel() {
+  const el = document.getElementById('intel-body');
+  if (!el) return;
+  const base = backendBase();
+  if (!base) { el.innerHTML = intelEmpty('Connect a backend to receive your daily brief here.'); return; }
+  try {
+    const r = await fetch(`${base}/api/brief`, { headers: apiHeaders() });
+    _intelData = await r.json();
+    if (!_intelData.latest) { el.innerHTML = intelEmpty('No brief yet. Your daily PR Intel task will post the first one here each morning.'); return; }
+    renderIntel(_intelData.latest.postedAt);
+  } catch { el.innerHTML = intelEmpty('Could not reach the backend.'); }
+}
+
+function allBriefs() {
+  const all = [];
+  if (_intelData.latest) all.push(_intelData.latest);
+  for (const h of (_intelData.history || [])) if (!all.find(x => x.postedAt === h.postedAt)) all.push(h);
+  return all;
+}
+function showBrief(postedAt) { renderIntel(postedAt); const el = document.getElementById('intel-body'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+
+function renderIntel(postedAt) {
+  const el = document.getElementById('intel-body');
+  if (!el) return;
+  const all = allBriefs();
+  const L = all.find(x => x.postedAt === postedAt) || all[0];
+  if (!L) { el.innerHTML = intelEmpty('No brief yet.'); return; }
+  const others = all.filter(x => x.postedAt !== L.postedAt).slice(0, 8);
+  el.innerHTML = `
+    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:16px;flex-wrap:wrap;">
+      <div style="font-family:var(--font-display);font-size:1.4rem;font-weight:400;letter-spacing:-.015em;color:var(--ink);">${esc(L.subject || 'PR Intelligence Brief')}</div>
+      <div class="eyebrow">${esc(L.date || (L.postedAt || '').slice(0, 10))}</div>
+    </div>
+    <div style="border:1px solid var(--rule);border-radius:var(--radius-lg);background:var(--surface);overflow:hidden;">${briefBodyHtml(L)}</div>
+    ${others.length ? `<div class="eyebrow" style="margin:34px 0 14px;">Earlier briefs</div>
+      <div style="display:flex;flex-direction:column;border:1px solid var(--rule);border-radius:var(--radius-lg);overflow:hidden;background:var(--surface);">
+        ${others.map((h, i) => `<div onclick="showBrief('${esc(h.postedAt)}')" style="cursor:pointer;padding:14px 20px;display:flex;align-items:center;justify-content:space-between;gap:14px;${i < others.length - 1 ? 'border-bottom:1px solid var(--rule);' : ''}transition:background var(--t-fast) var(--ease);" onmouseover="this.style.background='var(--paper-2)'" onmouseout="this.style.background=''">
+          <span class="truncate" style="font-size:.84rem;color:var(--ink);font-weight:500;">${esc(h.subject || 'PR Intelligence Brief')}</span>
+          <span style="font-size:.72rem;color:var(--ink-3);flex-shrink:0;">${esc(h.date || (h.postedAt || '').slice(0, 10))}</span>
+        </div>`).join('')}
+      </div>` : ''}`;
+}
+
+function briefBodyHtml(L) {
+  if (L.html) {
+    const doc = `<!doctype html><meta charset="utf-8"><base target="_blank"><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1a1815;line-height:1.55;padding:24px 28px;margin:0;font-size:14px;}a{color:#1a6fa3;}img{max-width:100%;height:auto;}table{max-width:100%;}pre{white-space:pre-wrap;}</style>${L.html}`;
+    return `<iframe id="intel-frame" style="width:100%;border:0;display:block;min-height:400px;" onload="resizeIntelFrame(this)" srcdoc="${esc(doc)}"></iframe>`;
+  }
+  if (L.markdown) return `<pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:.8rem;color:var(--ink);padding:24px 28px;margin:0;line-height:1.55;">${esc(L.markdown)}</pre>`;
+  return '';
+}
+function resizeIntelFrame(f) {
+  try { f.style.height = (f.contentWindow.document.body.scrollHeight + 36) + 'px'; } catch { f.style.height = '700px'; }
+}
+function intelEmpty(msg) {
+  return `<div style="border:1px dashed var(--rule);border-radius:var(--radius-lg);padding:64px 32px;text-align:center;">
+    <div style="width:48px;height:48px;border-radius:50%;background:var(--paper-2);margin:0 auto 16px;display:grid;place-items:center;">
+      <svg width="20" height="20" fill="none" stroke="var(--ink-3)" stroke-width="1.5" viewBox="0 0 24 24"><path d="M4 4h16v12H4z"/><path d="M7 8h10M7 12h6"/><path d="M8 20h8"/></svg>
+    </div>
+    <p style="font-size:.86rem;color:var(--ink-2);max-width:430px;margin:0 auto;line-height:1.55;">${esc(msg)}</p>
+  </div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1351,20 +2073,7 @@ function pageHome() {
   const today = new Date().toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' });
 
   return `
-  <nav class="no-print glass-nav" aria-label="Main">
-    <div class="wrap flex-between" style="padding:16px 32px;">
-      <div class="wordmark">
-        <span class="wordmark-dot"></span>
-        <span>Clippings</span>
-      </div>
-      <div class="flex gap-2">
-        <button onclick="openSettingsModal()" class="btn btn-ghost btn-sm" aria-label="Settings" style="padding:6px 10px;">
-          <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        </button>
-        <button onclick="openNewBookModal()" class="btn btn-primary btn-sm">New book</button>
-      </div>
-    </div>
-  </nav>
+  ${topNav('home')}
 
   ${books.length === 0 ? `
     <div style="min-height:calc(100vh - 64px);display:flex;align-items:center;">
@@ -1424,7 +2133,7 @@ function pageHome() {
       <div class="wrap stagger" style="padding:0 32px 40px;display:flex;flex-direction:column;gap:22px;">
         ${books.map(b => bookRow(b)).join('')}
       </div>
-      ${invoicesSummary()}
+      ${isOwner() ? invoicesSummary() : ''}
     </div>
   `}`;
 }
@@ -1602,10 +2311,10 @@ function pageBook(b) {
             Live data
           </button>
           <button onclick="exportCSV('${b.id}')" class="btn btn-ghost btn-sm hide-mobile">CSV</button>
-          <button onclick="openInvoiceModal('${b.id}')" class="btn btn-ghost btn-sm hide-mobile">
+          ${isOwner() ? `<button onclick="openInvoiceModal('${b.id}')" class="btn btn-ghost btn-sm hide-mobile">
             <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/></svg>
             Invoice
-          </button>
+          </button>` : ''}
           <button onclick="go('report','${b.id}')" class="btn btn-primary btn-sm">
             <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
             View Report
@@ -1957,6 +2666,7 @@ function renderMonitorTab(b) {
 // PAGE: INVOICE — billable document tied to the book
 // ═══════════════════════════════════════════════════════════════════
 function pageInvoice(b) {
+  if (!isOwner()) return `${topNav('home')}<div class="wrap" style="padding:90px 32px;text-align:center;color:var(--ink-3);font-size:.9rem;">Invoicing is available to the owner only.</div>`;
   const accent = b.accentColor || '#2d5f3d';
   if (!b.invoice) b.invoice = defaultInvoice(b);
   const inv = b.invoice;
@@ -2591,6 +3301,19 @@ function openEditModal(bookId, clipId) {
 }
 
 function openSettingsModal() {
+  if (!isOwner()) {
+    openModal(`
+    <div style="padding:36px;">
+      <div class="eyebrow" style="margin-bottom:10px;">Account</div>
+      <h2 style="font-family:var(--font-display);font-size:1.7rem;font-weight:400;letter-spacing:-.02em;line-height:1.1;margin-bottom:8px;">Signed in as staff</h2>
+      <p style="font-size:.84rem;color:var(--ink-3);line-height:1.55;margin-bottom:22px;">You can see all client projects, the Newsroom, and the Daily Intel brief — and add coverage. Invoicing is managed by the account owner.</p>
+      <div style="display:flex;gap:10px;padding-top:20px;border-top:1px solid var(--rule);">
+        <button onclick="closeModal()" class="btn btn-ghost" style="flex:1;">Close</button>
+        <button onclick="logout()" class="btn btn-primary" style="flex:1;">Log out</button>
+      </div>
+    </div>`);
+    return;
+  }
   openModal(`
   <div style="padding:36px;">
     <div style="margin-bottom:28px;">
@@ -2600,25 +3323,25 @@ function openSettingsModal() {
     </div>
     <div style="display:flex;flex-direction:column;gap:18px;max-height:60vh;overflow-y:auto;padding-right:4px;">
 
-      <div class="eyebrow" style="margin-bottom:-4px;">Backend service</div>
-      <div>
-        <label class="field-label">Backend URL <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;color:var(--ink-3);">— enables live data + 24/7 monitoring</span></label>
-        <div style="display:flex;gap:8px;">
-          <input id="s-backend" class="input" value="${esc(settings.backendUrl || '')}" placeholder="https://your-clippings-server.onrender.com" style="flex:1;">
+      <div class="eyebrow" style="margin-bottom:-4px;">Account & backup</div>
+      <div style="background:var(--paper-2);border:1px solid var(--rule);border-radius:var(--radius);padding:11px 13px;font-size:.74rem;color:var(--ink-2);line-height:1.55;">
+        ${auth.code
+          ? `Signed in as <strong style="color:var(--ink);">${role === 'staff' ? 'Staff' : 'Owner'}</strong> — connected to this app's server automatically. Your work saves to the cloud as you go, reachable from any device.`
+          : `<strong style="color:var(--ink);">Browser-only mode.</strong> Your data lives in this browser. Once the app is deployed, you'll sign in and it syncs across devices and your team.`}
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <button type="button" onclick="backupNow()" class="btn btn-ghost btn-sm">Back up now</button>
+        <button type="button" onclick="restoreFromCloud()" class="btn btn-ghost btn-sm">Restore from cloud</button>
+        <span style="font-size:.7rem;color:var(--ink-3);">${settings.lastBackupAt ? 'Last backup ' + fmtDateShort(new Date(settings.lastBackupAt).toISOString().slice(0,10)) : 'Auto-backs up as you work'}</span>
+      </div>
+      <details>
+        <summary style="font-size:.72rem;color:var(--ink-3);cursor:pointer;">Advanced — custom backend URL</summary>
+        <div style="display:flex;gap:8px;margin-top:8px;">
+          <input id="s-backend" class="input" value="${esc(settings.backendUrl || '')}" placeholder="Leave blank — auto-connects to this app" style="flex:1;">
           <button type="button" onclick="testBackend()" class="btn btn-ghost btn-sm" style="white-space:nowrap;">Test</button>
         </div>
-        <div id="s-backend-msg" style="font-size:.72rem;color:var(--ink-3);margin-top:7px;line-height:1.5;">When set, API keys live securely on the server and monitoring runs around the clock. Leave blank to use browser-only mode with the keys below.</div>
-      </div>
-      <div>
-        <label class="field-label">Backup token <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;color:var(--ink-3);">— optional, must match the server's API_TOKEN</span></label>
-        <input id="s-token" class="input" value="${esc(settings.apiToken || '')}" placeholder="Leave blank if your server has no token set">
-        <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
-          <button type="button" onclick="backupNow()" class="btn btn-ghost btn-sm">Back up now</button>
-          <button type="button" onclick="restoreFromCloud()" class="btn btn-ghost btn-sm">Restore from cloud</button>
-          <span style="font-size:.7rem;color:var(--ink-3);">${settings.lastBackupAt ? 'Last backup ' + fmtDateShort(new Date(settings.lastBackupAt).toISOString().slice(0,10)) : 'Auto-backs up as you work'}</span>
-        </div>
-        <div style="font-size:.72rem;color:var(--ink-3);margin-top:8px;line-height:1.5;">Your books back up to the backend automatically so they're safe and reachable from any device. Without a backend, data lives only in this browser.</div>
-      </div>
+        <div id="s-backend-msg" style="font-size:.72rem;color:var(--ink-3);margin-top:7px;line-height:1.5;">Normally leave blank — the app connects to its own server automatically. Only set this to point at a different backend.</div>
+      </details>
 
       <div style="height:1px;background:var(--rule);"></div>
       <div class="eyebrow" style="margin-bottom:-4px;">Data source keys</div>
@@ -2675,6 +3398,7 @@ function openSettingsModal() {
       </div>
     </div>
     <div style="display:flex;gap:10px;margin-top:24px;padding-top:22px;border-top:1px solid var(--rule);">
+      ${auth.code ? `<button onclick="logout()" class="btn btn-ghost" style="flex:0 0 auto;color:var(--red);">Log out</button>` : ''}
       <button onclick="closeModal()" class="btn btn-ghost" style="flex:1;">Cancel</button>
       <button onclick="saveSettings()" class="btn btn-primary" style="flex:1;">Save</button>
     </div>
@@ -2782,6 +3506,7 @@ async function fetchUsdRate(quote) {
 // so YOU choose exactly which coverage to bill.
 let _retainerCtx = null;
 async function loadRetainerTemplate(bookId) {
+  if (!isOwner()) { toast('Invoicing is available to the owner only'); return; }
   const b = books.find(x => x.id === bookId);
   if (!b) return;
   const cur = (document.getElementById('inv-currency')?.value || settings.currency || 'PHP').toUpperCase();
@@ -2805,6 +3530,7 @@ async function loadRetainerTemplate(bookId) {
 
 // Step 2: tick exactly the placements you're billing. Live total updates.
 function openPlacementPicker(bookId, rate) {
+  if (!isOwner()) { toast('Invoicing is available to the owner only'); return; }
   const b = books.find(x => x.id === bookId);
   if (!b) return;
   const cur = (_retainerCtx && _retainerCtx.currency) || settings.currency || 'PHP';
@@ -2858,6 +3584,7 @@ function updatePickerTotal(bookId, rate) {
 
 // Step 3: build the invoice from the ticked placements + live rate.
 function generateRetainerInvoice(bookId, rate) {
+  if (!isOwner()) { toast('Invoicing is available to the owner only'); return; }
   const b = books.find(x => x.id === bookId);
   if (!b) return;
   const cur = (_retainerCtx && _retainerCtx.currency) || settings.currency || 'PHP';
@@ -2896,6 +3623,7 @@ function generateRetainerInvoice(bookId, rate) {
 }
 
 function openInvoiceModal(bookId) {
+  if (!isOwner()) { toast('Invoicing is available to the owner only'); return; }
   const b = books.find(x => x.id === bookId);
   if (!b) return;
   const inv = b.invoice || defaultInvoice(b);
@@ -2981,6 +3709,7 @@ function collectInvoice() {
 }
 
 function saveInvoice(bookId, preview) {
+  if (!isOwner()) { toast('Invoicing is available to the owner only'); return; }
   const b = books.find(x => x.id === bookId);
   if (!b) return;
   const prev = b.invoice || {};
@@ -3043,7 +3772,7 @@ async function publishReport(bookId) {
   try {
     const r = await fetch(`${base}/api/reports/publish`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(settings.apiToken ? { 'X-Clippings-Token': settings.apiToken } : {}) },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ slug: b.publishedSlug || undefined, title, html }),
     });
     const j = await r.json();
@@ -3311,7 +4040,7 @@ async function testBackend() {
 
 function saveSettings() {
   settings.backendUrl = document.getElementById('s-backend')?.value?.trim() || '';
-  settings.apiToken = document.getElementById('s-token')?.value?.trim() || '';
+  // (Backup-token field retired — authentication now uses the sign-in passcode.)
   settings.oprKey = document.getElementById('s-oprkey')?.value?.trim() || '';
   settings.simKey = document.getElementById('s-simkey')?.value?.trim() || '';
   settings.agency = document.getElementById('s-agency')?.value?.trim() || 'VillaromanPR';
@@ -3828,21 +4557,66 @@ if (!localStorage.getItem('clippings_v12_seeded')) {
   localStorage.setItem('clippings_v12_seeded', '1');
 }
 load();
+
+// Full-page passcode screen (shown only when the backend requires sign-in
+// and we don't yet have a valid stored passcode). Nothing else renders.
+function renderLogin(msg) {
+  const root = document.getElementById('root');
+  root.innerHTML = `
+  <div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;">
+    <div style="width:100%;max-width:380px;text-align:center;">
+      <div class="wordmark" style="justify-content:center;margin-bottom:26px;"><span class="wordmark-dot"></span><span>Clippings</span></div>
+      <h1 style="font-family:var(--font-display);font-size:1.9rem;font-weight:400;letter-spacing:-.02em;margin-bottom:8px;color:var(--ink);">Sign in</h1>
+      <p style="font-size:.84rem;color:var(--ink-3);line-height:1.5;margin-bottom:22px;">Enter your team passcode to continue.</p>
+      <input id="login-code" type="password" class="input" placeholder="Passcode" style="text-align:center;" onkeydown="if(event.key==='Enter')doLogin()" autocomplete="off">
+      <div id="login-msg" style="font-size:.76rem;color:var(--red);min-height:18px;margin-top:10px;">${msg ? esc(msg) : ''}</div>
+      <button onclick="doLogin()" class="btn btn-primary btn-lg" style="width:100%;margin-top:4px;">Continue</button>
+      <p style="font-size:.68rem;color:var(--ink-3);margin-top:24px;letter-spacing:0.02em;">Villaroman PR · private workspace</p>
+    </div>
+  </div>`;
+  setTimeout(() => document.getElementById('login-code')?.focus(), 50);
+}
+
+async function doLogin() {
+  const code = document.getElementById('login-code')?.value?.trim();
+  const msg = document.getElementById('login-msg');
+  if (!code) { if (msg) msg.textContent = 'Enter your passcode.'; return; }
+  try {
+    const r = await fetch(`${backendBase()}/api/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.ok) { setAuth(code, j.role); await cloudPull(); bootFinish(); }
+    else if (msg) msg.textContent = j.error || 'Wrong code. Try again.';
+  } catch { if (msg) msg.textContent = 'Could not reach the server. Check your connection.'; }
+}
+
+function bootFinish() {
+  // Seed the demo only for the owner (or local browser-only mode) when empty —
+  // never auto-seed on a staff device or over a real cloud library.
+  if (books.length === 0 && role === 'owner') loadDemo();
+  render();
+  setTimeout(() => { autoMonitorAll(); }, 2000);
+  if (!window._clipMonTimer) window._clipMonTimer = setInterval(() => { autoMonitorAll(); }, 30 * 60 * 1000);
+}
+
 (function boot() {
-  const finish = () => {
-    // Seed the demo only if there's nothing locally AND nothing in the cloud.
-    if (books.length === 0) loadDemo();
-    render();
-    // Automatic news/keyword monitoring while the app is open.
-    setTimeout(() => { autoMonitorAll(); }, 4000);
-    setInterval(() => { autoMonitorAll(); }, 30 * 60 * 1000);
-  };
-  if (backendBase()) {
-    render();                       // paint immediately with whatever's local
-    cloudPull().finally(finish);    // adopt cloud if newer, THEN maybe seed demo
-  } else {
-    finish();
-  }
+  const base = backendBase();
+  if (!base) { bootFinish(); return; }   // browser-only mode: no login
+  render();                              // paint local immediately
+  (async () => {
+    let authRequired = false;
+    try { const h = await (await fetch(`${base}/api/health`)).json(); authRequired = !!h.authRequired; } catch {}
+    if (authRequired) {
+      let ok = false;
+      if (auth.code) {
+        try {
+          const r = await fetch(`${base}/api/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: auth.code }) });
+          if (r.ok) { const j = await r.json(); if (j.ok) { setAuth(auth.code, j.role); ok = true; } }
+        } catch {}
+      }
+      if (!ok) { renderLogin(); return; } // gate: stop until they sign in
+    }
+    cloudPull().finally(bootFinish);     // adopt cloud if newer, then finish
+  })();
 })();
 </script>
 </body>
