@@ -54,6 +54,9 @@ function loadStore() {
   if (!store.briefs) store.briefs = [];
   if (!store.contacts) store.contacts = [];
   if (!store.pitches) store.pitches = [];
+  if (!store.expenses) store.expenses = [];
+  if (!store.opportunities) store.opportunities = [];
+  if (!('asanaToken' in store)) store.asanaToken = '';
 }
 
 // ── Roles ───────────────────────────────────────────────────────────
@@ -180,6 +183,59 @@ function parseRss(xml) {
     });
   }
   return items;
+}
+
+// ── News query curation (kills the Shiba-Inu-COIN collision, not tech news) ──
+// Narrow, memecoin-specific signals only. We deliberately DON'T block generic
+// fintech words (crypto/token/blockchain/funding) — those legitimately appear
+// in startup/CFO/funding coverage of our clients (e.g. e27, Tech in Asia), and
+// blocking them was silently dropping real Dr. Shiba / Tyger Brands stories.
+const NOISE_TERMS = ['dogecoin', ' shib ', '$shib', 'shiba inu coin', 'shib price', 'shib token', 'shibarium', 'shib army', 'memecoin', 'altcoin', 'price prediction', 'whale alert', 'to the moon'];
+function isNoise(text) {
+  const t = ' ' + String(text || '').toLowerCase() + ' ';
+  return NOISE_TERMS.some(n => t.includes(n));
+}
+// Appended to every Google News query — only the precise coin collisions, so
+// startup/tech/business coverage of our brands is NOT excluded.
+const QUERY_EXCLUSIONS = '-dogecoin -memecoin -"price prediction" -"shiba inu coin" -shibarium';
+// Turn a bare keyword into a precise query: exact-phrase a multi-word brand
+// name (unless the user already used quotes/operators), then add exclusions.
+// Power users can write full boolean directly, e.g.
+//   "Dr. Shiba" OR "Tyger Brands" OR "Magic Mist"
+// and it passes through untouched (just exclusions appended).
+function buildQuery(kw) {
+  let q = String(kw || '').trim();
+  if (!q) return '';
+  const hasOps = /["()]|\bOR\b|\bAND\b|(^|\s)-\S/.test(q);
+  if (!hasOps && /\s/.test(q)) q = `"${q}"`;
+  return `${q} ${QUERY_EXCLUSIONS}`;
+}
+// Two query variants per keyword: the precise exact-phrase, plus a broader
+// unquoted recall pass for multi-word brands (relevance-guarded at ingest).
+// Boolean keywords (with quotes/OR/AND) are used verbatim — no broad variant.
+function queryVariants(kw) {
+  const q = String(kw || '').trim();
+  if (!q) return [];
+  const hasOps = /["()]|\bOR\b|\bAND\b|(^|\s)-\S/.test(q);
+  // Precise/boolean pass: trust Google's phrase match (the brand may be in the
+  // article body, not the title — don't second-guess it).
+  const out = [{ q: buildQuery(q), guard: false }];
+  // Broad recall pass for plain multi-word brands: looser match, so we apply a
+  // title relevance guard to keep coin/unrelated posts out.
+  if (!hasOps && /\s/.test(q)) out.push({ q: `${q} ${QUERY_EXCLUSIONS}`, guard: true });
+  const seen = new Set();
+  return out.filter(v => !seen.has(v.q) && seen.add(v.q));
+}
+// Relevance guard for the broad pass: every significant word of a plain
+// keyword must appear in the title, so "Shiba Inu (SHIB)" coin posts don't
+// sneak in under a "Dr. Shiba" search. Explicit-boolean keywords are trusted.
+function titleRelevant(title, kw) {
+  const q = String(kw || '');
+  if (/["()]|\bOR\b|\bAND\b/.test(q)) return true;
+  const t = ' ' + String(title || '').toLowerCase() + ' ';
+  const words = q.toLowerCase().split(/\s+/).map(w => w.replace(/[^a-z0-9]/g, '')).filter(w => w.length > 1);
+  if (!words.length) return true;
+  return words.every(w => t.includes(w));
 }
 
 // ── Contacts / byline harvest (the self-building media database) ─────
@@ -389,6 +445,7 @@ app.get('/api/health', (req, res) => {
     mentions: store.mentions.length,
     contacts: store.contacts.length,
     pitches: store.pitches.length,
+    asana: !!asanaToken(),
     checkEveryMinutes: CHECK_MINUTES,
   });
 });
@@ -445,6 +502,37 @@ app.get('/api/mentions', requireAuth, (req, res) => {
   if (since) out = out.filter(m => Date.parse(m.foundAt) > since);
   res.json({ mentions: out });
 });
+// Ingest coverage found OUTSIDE the Google News sweep — e.g. a Cowork task that
+// reads your Google Alerts (Google's WEB index catches Cloudflare-walled outlets
+// like e27 that the News RSS can't), or a manual paste. Lands in the Newsroom
+// "to review" queue, deduped by client+url. Body: one object or {mentions:[...]}.
+app.post('/api/mentions', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const list = Array.isArray(body) ? body : (Array.isArray(body.mentions) ? body.mentions : [body]);
+  let added = 0; const out = [];
+  for (const m of list) {
+    const url = String(m.url || '').trim();
+    if (!url && !m.title) continue;
+    let client = m.clientId ? store.clients.find(c => c.id === m.clientId) : null;
+    if (!client && m.clientName) client = store.clients.find(c => (c.name || '').toLowerCase() === String(m.clientName).toLowerCase());
+    const clientId = client ? client.id : (m.clientId || '');
+    const clientName = client ? client.name : (m.clientName || '');
+    const key = (clientId || '*') + '|' + url;
+    if (url && store.seen[key]) continue;        // already known — skip
+    if (url) store.seen[key] = Date.now();
+    let date = m.date || '';
+    try { if (m.date) date = new Date(m.date).toISOString().slice(0, 10); } catch {}
+    const mention = {
+      id: Math.random().toString(36).slice(2, 10),
+      clientId, clientName, keyword: m.keyword || '',
+      title: m.title || '', url, outlet: m.outlet || '', author: m.author || '',
+      date, source: m.source || 'alert', foundAt: new Date().toISOString(),
+    };
+    store.mentions.push(mention); out.push(mention); added++;
+  }
+  if (added) saveStore();
+  res.json({ ok: true, added, mentions: out });
+});
 
 // ── Media contacts (journalists / influencers) — shared team DB ─────
 app.get('/api/contacts', requireAuth, (req, res) => {
@@ -496,6 +584,176 @@ app.delete('/api/pitches/:id', requireAuth, (req, res) => {
   store.pitches = store.pitches.filter(p => p.id !== req.params.id);
   saveStore();
   res.json({ ok: true, removed: before - store.pitches.length });
+});
+
+// ── Expenses (team-shared) — what the owner pays for monthly; staff log them ─
+// NOT invoicing: invoices (client billing) stay owner-only. Expenses are the
+// record of tools/subscriptions/reimbursements the owner covers for the team.
+function upsertExpense(input) {
+  if (!input || (!input.id && !input.item)) return null;
+  let e = input.id ? store.expenses.find(x => x.id === input.id) : null;
+  if (!e) {
+    e = { id: input.id || ('e' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)), item: '', category: '', client: '', amount: 0, currency: 'PHP', recurring: 'monthly', date: '', status: 'pending', notes: '', loggedBy: '', createdAt: Date.now(), updatedAt: Date.now() };
+    store.expenses.push(e);
+  }
+  for (const k of ['item', 'category', 'client', 'amount', 'currency', 'recurring', 'date', 'status', 'notes', 'loggedBy']) if (input[k] !== undefined) e[k] = input[k];
+  e.amount = +e.amount || 0;
+  e.updatedAt = Date.now();
+  return e;
+}
+app.get('/api/expenses', requireAuth, (req, res) => { res.json({ expenses: store.expenses }); });
+app.post('/api/expenses', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const list = Array.isArray(body) ? body : (Array.isArray(body.expenses) ? body.expenses : [body]);
+  const out = []; for (const item of list) { const e = upsertExpense(item); if (e) out.push(e); }
+  saveStore();
+  res.json({ ok: true, upserted: out.length, expenses: out });
+});
+app.delete('/api/expenses/:id', requireAuth, (req, res) => {
+  const before = store.expenses.length;
+  store.expenses = store.expenses.filter(e => e.id !== req.params.id);
+  saveStore();
+  res.json({ ok: true, removed: before - store.expenses.length });
+});
+
+// ── Opportunities (team-shared) — live, news-driven openings ────────
+// collab targets, competitor counters, news tie-ins. Fed by the daily brief
+// (source:'brief') or flagged manually. Sits above the seasonal calendar.
+function upsertOpportunity(input) {
+  if (!input || (!input.id && !input.title)) return null;
+  let o = input.id ? store.opportunities.find(x => x.id === input.id) : null;
+  // Re-runs daily/weekly — match an existing card (even a dismissed one) and update it in place; never duplicate, and a dismissed "no" stays dismissed unless a human reopens it.
+  if (!o && input.title) o = store.opportunities.find(x => (x.title || '').toLowerCase().trim() === String(input.title).toLowerCase().trim() && (x.client || '') === (input.client || ''));
+  if (!o) {
+    o = { id: input.id || ('o' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)), type: 'news', title: '', client: '', why: '', link: '', source: 'manual', status: 'open', date: '', owner: '', createdAt: Date.now(), updatedAt: Date.now() };
+    store.opportunities.push(o);
+  }
+  for (const k of ['type', 'title', 'client', 'why', 'link', 'source', 'status', 'date', 'owner']) if (input[k] !== undefined) o[k] = input[k];
+  o.updatedAt = Date.now();
+  return o;
+}
+app.get('/api/opportunities', requireAuth, (req, res) => { res.json({ opportunities: store.opportunities }); });
+app.post('/api/opportunities', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const list = Array.isArray(body) ? body : (Array.isArray(body.opportunities) ? body.opportunities : [body]);
+  const out = []; for (const item of list) { const o = upsertOpportunity(item); if (o) out.push(o); }
+  saveStore();
+  res.json({ ok: true, upserted: out.length, opportunities: out });
+});
+app.delete('/api/opportunities/:id', requireAuth, (req, res) => {
+  const before = store.opportunities.length;
+  store.opportunities = store.opportunities.filter(o => o.id !== req.params.id);
+  saveStore();
+  res.json({ ok: true, removed: before - store.opportunities.length });
+});
+
+// ── Asana integration (live two-way) ───────────────────────────────
+// Token: ASANA_TOKEN env var (durable across Render redeploys) OR an in-app
+// paste stored in store.asanaToken. The in-app value wins so it can be updated
+// without a redeploy; on the free tier store.asanaToken resets on redeploy, so
+// the env var is the durable option. The token is owner-set and never returned.
+const ASANA_TOKEN_ENV = process.env.ASANA_TOKEN || '';
+const ASANA_BASE = 'https://app.asana.com/api/1.0';
+function asanaToken() { return (store.asanaToken || ASANA_TOKEN_ENV || '').trim(); }
+let _asanaWs = null;
+let _asanaCache = { at: 0, tasks: null };
+
+async function asanaApi(p, opts = {}) {
+  const tok = asanaToken();
+  if (!tok) { const e = new Error('Asana not connected'); e.code = 'not_connected'; throw e; }
+  const headers = { Authorization: 'Bearer ' + tok, Accept: 'application/json', ...(opts.headers || {}) };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(ASANA_BASE + p, { method: opts.method || 'GET', headers, body: opts.body });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error((j.errors && j.errors[0] && j.errors[0].message) || ('Asana error ' + r.status)); e.status = r.status; throw e; }
+  return j;
+}
+async function asanaWorkspace() {
+  if (_asanaWs) return _asanaWs;
+  const me = await asanaApi('/users/me?opt_fields=workspaces.name');
+  _asanaWs = me.data && me.data.workspaces && me.data.workspaces[0] && me.data.workspaces[0].gid;
+  if (!_asanaWs) throw new Error('No Asana workspace found for this token');
+  return _asanaWs;
+}
+// Best-effort client tag from a task's project names. Never invented —
+// blank when no client keyword matches (those group under "Other / Ops").
+function asanaClient(projNames) {
+  const s = (projNames || []).join(' ').toLowerCase();
+  // Dr. Shiba is the umbrella: Prof. Bengal (cats) + CEO Philipp Renner + CFO all roll up here.
+  if (/shiba|prof\.? ?bengal|bengal|furpal|\bpal\b|oatside|sunnies|content360|magic mist|philipp renner|\brenner\b|gruenewald|tyger/.test(s)) return 'Dr. Shiba';
+  if (/sicilian|frozen tiramisu|\broast\b|lorenzo vega|matt navarro|navarro/.test(s)) return 'Sicilian Roast';
+  if (/seed inclusivity|seedstars|demo day|visa foundation|\beso\b|petanetra|karla|silang|sanad|elevateher|cohort/.test(s)) return 'Seedstars';
+  return '';
+}
+function asanaTaskStatus(dueOn) {
+  if (!dueOn) return 'none';
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const d = new Date(dueOn + 'T00:00:00');
+  const days = Math.round((d - today) / 86400000);
+  if (days < 0) return 'overdue';
+  if (days === 0) return 'today';
+  if (days <= 7) return 'soon';
+  return 'upcoming';
+}
+function mapAsanaTask(t) {
+  const projects = (t.projects || []).map(p => p.name).filter(Boolean);
+  return {
+    gid: t.gid, name: t.name || '(untitled)', dueOn: t.due_on || '',
+    completed: !!t.completed, projects, client: asanaClient(projects),
+    url: t.permalink_url || ('https://app.asana.com/0/0/' + t.gid),
+    status: asanaTaskStatus(t.due_on),
+  };
+}
+
+app.get('/api/asana/status', requireAuth, (req, res) => {
+  res.json({ connected: !!asanaToken(), source: store.asanaToken ? 'app' : (ASANA_TOKEN_ENV ? 'env' : null) });
+});
+// Owner pastes / clears the Personal Access Token. Validates by hitting Asana.
+app.post('/api/asana/connect', requireOwner, async (req, res) => {
+  const token = ((req.body && req.body.token) || '').trim();
+  store.asanaToken = token; _asanaWs = null; _asanaCache = { at: 0, tasks: null };
+  saveStore();
+  if (!token) return res.json({ ok: true, connected: false });
+  try { await asanaWorkspace(); res.json({ ok: true, connected: true }); }
+  catch (e) { res.status(400).json({ ok: false, connected: false, error: e.message }); }
+});
+// Live read of the token owner's incomplete tasks (60s cache; ?fresh=1 bypasses).
+app.get('/api/asana/tasks', requireAuth, async (req, res) => {
+  if (!asanaToken()) return res.json({ connected: false, tasks: [] });
+  try {
+    if (req.query.fresh || !_asanaCache.tasks || (Date.now() - _asanaCache.at) > 60000) {
+      const ws = await asanaWorkspace();
+      const j = await asanaApi(`/tasks?assignee=me&workspace=${ws}&completed_since=now&limit=100&opt_fields=name,due_on,completed,projects.name,permalink_url`);
+      _asanaCache = { at: Date.now(), tasks: (j.data || []).map(mapAsanaTask).filter(t => !t.completed) };
+    }
+    res.json({ connected: true, tasks: _asanaCache.tasks, cachedAt: _asanaCache.at });
+  } catch (e) { res.status(502).json({ connected: true, tasks: [], error: e.message }); }
+});
+// Projects for the create-task picker.
+app.get('/api/asana/projects', requireAuth, async (req, res) => {
+  if (!asanaToken()) return res.json({ connected: false, projects: [] });
+  try {
+    const ws = await asanaWorkspace();
+    const j = await asanaApi(`/projects?workspace=${ws}&archived=false&limit=100&opt_fields=name`);
+    res.json({ connected: true, projects: (j.data || []).map(p => ({ gid: p.gid, name: p.name })) });
+  } catch (e) { res.status(502).json({ connected: true, projects: [], error: e.message }); }
+});
+// Create a task (write-back from a pitch / opportunity / ad-hoc).
+app.post('/api/asana/tasks', requireAuth, async (req, res) => {
+  if (!asanaToken()) return res.status(400).json({ ok: false, error: 'Asana not connected' });
+  const b = req.body || {};
+  if (!b.name || !String(b.name).trim()) return res.status(400).json({ ok: false, error: 'Task name required' });
+  try {
+    const ws = await asanaWorkspace();
+    const data = { name: String(b.name).trim(), assignee: b.assignee || 'me' };
+    if (b.notes) data.notes = String(b.notes);
+    if (b.dueOn) data.due_on = b.dueOn;
+    // Asana errors if both projects + workspace are given — use one or the other.
+    if (b.projectGid) data.projects = [b.projectGid]; else data.workspace = ws;
+    const j = await asanaApi('/tasks?opt_fields=name,due_on,completed,projects.name,permalink_url', { method: 'POST', body: JSON.stringify({ data }) });
+    _asanaCache = { at: 0, tasks: null };
+    res.json({ ok: true, task: mapAsanaTask(j.data || {}) });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 });
 
 // ── Cloud backup of the whole library (books + settings) ────────────
@@ -607,27 +865,31 @@ async function sweep() {
   try {
     for (const c of store.clients) {
       for (const kw of c.keywords) {
-        const rss = `https://news.google.com/rss/search?q=${encodeURIComponent(kw)}&hl=en&gl=${NEWS_REGION}&ceid=${NEWS_REGION}:en`;
-        try {
-          const r = await fetch(rss, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ClippingsBot/1.0)' } });
-          const xml = await r.text();
-          for (const it of parseRss(xml)) {
-            if (!it.link) continue;
-            const key = c.id + '|' + it.link;
-            if (store.seen[key]) continue;
-            store.seen[key] = Date.now();
-            let date = '';
-            try { date = new Date(it.pubDate).toISOString().slice(0, 10); } catch {}
-            store.mentions.push({
-              id: Math.random().toString(36).slice(2, 10),
-              clientId: c.id, clientName: c.name, keyword: kw,
-              title: it.title, url: it.link, outlet: it.source || '',
-              sourceUrl: it.sourceUrl || '',
-              date, foundAt: new Date().toISOString(),
-            });
-            added++;
-          }
-        } catch (e) { console.error('sweep error for', kw, '-', e.message); }
+        for (const v of queryVariants(kw)) {
+          const rss = `https://news.google.com/rss/search?q=${encodeURIComponent(v.q)}&hl=en&gl=${NEWS_REGION}&ceid=${NEWS_REGION}:en`;
+          try {
+            const r = await fetch(rss, { headers: { 'User-Agent': UA } });
+            const xml = await r.text();
+            for (const it of parseRss(xml)) {
+              if (!it.link) continue;
+              if (isNoise(it.title)) continue;          // cut memecoin collision noise
+              if (v.guard && !titleRelevant(it.title, kw)) continue; // broad pass only
+              const key = c.id + '|' + it.link;
+              if (store.seen[key]) continue;
+              store.seen[key] = Date.now();
+              let date = '';
+              try { date = new Date(it.pubDate).toISOString().slice(0, 10); } catch {}
+              store.mentions.push({
+                id: Math.random().toString(36).slice(2, 10),
+                clientId: c.id, clientName: c.name, keyword: kw,
+                title: it.title, url: it.link, outlet: it.source || '',
+                sourceUrl: it.sourceUrl || '',
+                date, foundAt: new Date().toISOString(),
+              });
+              added++;
+            }
+          } catch (e) { console.error('sweep error for', kw, '-', e.message); }
+        }
       }
     }
     // Byline harvest — enrich a few new, un-tried mentions per run (rate-limited
@@ -635,7 +897,8 @@ async function sweep() {
     const _toEnrich = store.mentions.filter(m => !m.enrichTried && !m.author).slice(-8);
     for (const m of _toEnrich) { try { await enrichMention(m); } catch {} }
     if (_toEnrich.length) saveStore();
-    // Keep storage bounded.
+    // Drop any stored noise (crypto/coin collisions) + keep storage bounded.
+    store.mentions = store.mentions.filter(m => !isNoise(m.title));
     if (store.mentions.length > 500) store.mentions = store.mentions.slice(-500);
     pruneSeen();
     if (added) { console.log(`[sweep] +${added} new mention(s)`); saveStore(); }
@@ -657,6 +920,14 @@ function pruneSeen() {
 app.post('/api/sweep', requireAuth, async (req, res) => {
   const added = await sweep();
   res.json({ ok: true, added });
+});
+
+// Flush all mentions + dedupe memory, then re-sweep with the curated queries.
+app.post('/api/mentions/clear', requireAuth, (req, res) => {
+  store.mentions = []; store.seen = {};
+  saveStore();
+  res.json({ ok: true });
+  sweep().catch(() => {});
 });
 
 setInterval(() => { sweep().catch(() => {}); }, CHECK_MINUTES * 60 * 1000);
