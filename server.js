@@ -36,15 +36,34 @@ const AUTH_ON = !!OWNER_PASS;
 // Public base URL for share links (set behind a proxy/custom domain).
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 
+// ── Durable store (optional, free): mirror the JSON store to a PRIVATE
+// GitHub repo so data survives the host's ephemeral-disk wipes (every
+// redeploy + idle cold-start on free tiers). Set STORE_REPO ("owner/repo",
+// a *private* repo) and GITHUB_TOKEN (a fine-grained PAT with Contents:
+// read & write on just that repo) to enable. Unset or unreachable ⇒ the
+// server falls back to the local JSON file below and never blocks a
+// request on the network. The store can hold invoice figures, so the repo
+// MUST be private (a fine-grained token scoped to that one repo keeps the
+// blast radius tiny if it ever leaks).
+const STORE_REPO = (process.env.STORE_REPO || '').trim();   // e.g. "mdvillaroman/clippings-data"
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || '').trim();
+const STORE_PATH = (process.env.STORE_PATH || 'store.json').trim();
+const STORE_BRANCH = (process.env.STORE_BRANCH || 'main').trim();
+const REMOTE_ENABLED = !!(STORE_REPO && GITHUB_TOKEN);
+let _remoteSha = null;   // last known blob SHA (GitHub needs it to update a file)
+const GH_HEADERS = () => ({
+  Authorization: `Bearer ${GITHUB_TOKEN}`,
+  'User-Agent': 'clippings-backend',
+  Accept: 'application/vnd.github+json',
+});
+
 // ── Persistence (simple JSON file; rebuilds itself if lost) ──────────
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'store.json');
 const PUBLISHED_DIR = path.join(__dirname, 'published');
 try { fs.mkdirSync(PUBLISHED_DIR, { recursive: true }); } catch {}
 let store = { clients: [], mentions: [], seen: {}, published: [], library: null, brief: null, briefs: [], contacts: [], pitches: [] };
-function loadStore() {
-  try {
-    store = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch { /* fresh store */ }
+function normalizeStore() {
+  if (!store || typeof store !== 'object') store = {};
   if (!store.clients) store.clients = [];
   if (!store.mentions) store.mentions = [];
   if (!store.seen) store.seen = {};
@@ -56,7 +75,36 @@ function loadStore() {
   if (!store.pitches) store.pitches = [];
   if (!store.expenses) store.expenses = [];
   if (!store.opportunities) store.opportunities = [];
+  if (!store.coverage) store.coverage = [];                // auto-filed coverage (monthly books)
+  if (!store.coverageSuppress) store.coverageSuppress = {}; // "clientId|url" she removed → never re-file
   if (!('asanaToken' in store)) store.asanaToken = '';
+}
+function loadStore() {
+  try { store = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
+  catch { /* fresh store */ }
+  normalizeStore();
+}
+// Pull the durable copy from the private repo on boot. Overrides the local
+// file when present; on any failure we keep whatever loadStore() set.
+async function loadStoreRemote() {
+  if (!REMOTE_ENABLED) return false;
+  try {
+    const url = `https://api.github.com/repos/${STORE_REPO}/contents/${encodeURIComponent(STORE_PATH)}?ref=${encodeURIComponent(STORE_BRANCH)}`;
+    const r = await fetch(url, { headers: GH_HEADERS() });
+    if (r.status === 404) { console.log('durable store: none yet (created on first save)'); return false; }
+    if (!r.ok) { console.error('durable store load failed: HTTP', r.status); return false; }
+    const j = await r.json();
+    _remoteSha = j.sha || null;
+    const content = Buffer.from(j.content || '', j.encoding || 'base64').toString('utf8');
+    if (!content.trim()) return false;
+    const parsed = JSON.parse(content);
+    if (parsed && typeof parsed === 'object') {
+      store = parsed; normalizeStore();
+      console.log('durable store: loaded from', STORE_REPO);
+      return true;
+    }
+  } catch (e) { console.error('durable store load error:', e.message); }
+  return false;
 }
 
 // ── Roles ───────────────────────────────────────────────────────────
@@ -113,6 +161,49 @@ function saveStore() {
     try { fs.writeFileSync(DATA_FILE, JSON.stringify(store)); }
     catch (e) { console.error('store save failed:', e.message); }
   }, 250);
+  saveStoreRemote();
+}
+// Mirror the store to the private repo (debounced + non-overlapping, so a
+// burst of saves coalesces into a single commit and a slow network never
+// blocks or stacks requests). Fully fail-soft: errors are logged, not thrown.
+let _remoteTimer = null, _remoteInflight = false, _remoteDirty = false;
+function saveStoreRemote() {
+  if (!REMOTE_ENABLED) return;
+  clearTimeout(_remoteTimer);
+  _remoteTimer = setTimeout(pushRemote, 4000);
+}
+async function pushRemote() {
+  if (!REMOTE_ENABLED) return;
+  if (_remoteInflight) { _remoteDirty = true; return; }
+  _remoteInflight = true; _remoteDirty = false;
+  try {
+    const url = `https://api.github.com/repos/${STORE_REPO}/contents/${encodeURIComponent(STORE_PATH)}`;
+    const body = {
+      message: `store ${new Date().toISOString()}`,
+      content: Buffer.from(JSON.stringify(store)).toString('base64'),
+      branch: STORE_BRANCH,
+    };
+    if (_remoteSha) body.sha = _remoteSha;
+    let r = await fetch(url, { method: 'PUT', headers: { ...GH_HEADERS(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (r.status === 409) {            // SHA drifted — refetch it and retry once
+      await loadShaOnly();
+      if (_remoteSha) body.sha = _remoteSha; else delete body.sha;
+      r = await fetch(url, { method: 'PUT', headers: { ...GH_HEADERS(), 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    }
+    if (r.ok) { const j = await r.json(); _remoteSha = (j.content && j.content.sha) || _remoteSha; }
+    else console.error('durable store save failed: HTTP', r.status);
+  } catch (e) { console.error('durable store save error:', e.message); }
+  finally {
+    _remoteInflight = false;
+    if (_remoteDirty) saveStoreRemote();   // a change landed mid-flight — flush it
+  }
+}
+async function loadShaOnly() {
+  try {
+    const url = `https://api.github.com/repos/${STORE_REPO}/contents/${encodeURIComponent(STORE_PATH)}?ref=${encodeURIComponent(STORE_BRANCH)}`;
+    const r = await fetch(url, { headers: GH_HEADERS() });
+    if (r.ok) { const j = await r.json(); _remoteSha = j.sha || _remoteSha; }
+  } catch { /* keep old sha */ }
 }
 loadStore();
 
@@ -438,6 +529,7 @@ app.get('/api/health', (req, res) => {
     similarweb: !!SIMILARWEB_KEY,
     tokenRequired: !!API_TOKEN,
     authRequired: AUTH_ON,
+    persisted: REMOTE_ENABLED,
     staffEnabled: !!STAFF_PASS,
     published: store.published.length,
     hasLibrary: !!store.library,
@@ -445,6 +537,7 @@ app.get('/api/health', (req, res) => {
     mentions: store.mentions.length,
     contacts: store.contacts.length,
     pitches: store.pitches.length,
+    coverage: store.coverage.length,
     asana: !!asanaToken(),
     checkEveryMinutes: CHECK_MINUTES,
   });
@@ -645,6 +738,79 @@ app.delete('/api/opportunities/:id', requireAuth, (req, res) => {
   store.opportunities = store.opportunities.filter(o => o.id !== req.params.id);
   saveStore();
   res.json({ ok: true, removed: before - store.opportunities.length });
+});
+
+// ── Auto-coverage: pieces the daily AI task files into monthly books ──
+// A "monthly book" is not a stored object — it is all coverage for one client
+// in one month, grouped by the app. The agent POSTs filed pieces here; the
+// owner can edit or remove (remove suppresses the URL so it never re-files).
+function monthOf(dateStr) {
+  const t = Date.parse(dateStr || '');
+  const d = t ? new Date(t) : new Date();
+  return d.toISOString().slice(0, 7);   // "2026-05"
+}
+function coverageKey(clientId, url) { return (clientId || '') + '|' + (url || ''); }
+const COV_NUM = ['domainAuthority', 'estimatedViews', 'reach', 'socialShares'];
+function upsertCoverage(input) {
+  if (!input || !input.url) return null;
+  const clientId = input.clientId || '';
+  const key = coverageKey(clientId, input.url);
+  if (store.coverageSuppress[key]) return null;     // removed by owner → never re-file
+  let c = store.coverage.find(x => coverageKey(x.clientId, x.url) === key);
+  if (c) return c;                                   // already filed → never clobber an edit
+  c = {
+    id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    clientId, clientName: input.clientName || '',
+    month: input.month || monthOf(input.date),
+    title: input.title || '', url: input.url,
+    outlet: input.outlet || '', outletDomain: input.outletDomain || '',
+    date: input.date || '',
+    screenshot: input.screenshot || '',
+    domainAuthority: +input.domainAuthority || 0,
+    estimatedViews: +input.estimatedViews || 0,
+    reach: +input.reach || 0,
+    socialShares: +input.socialShares || 0,
+    source: input.source === 'manual' ? 'manual' : 'auto',
+    confidence: input.confidence === 'low' ? 'low' : 'high',
+    edited: false,
+    createdAt: Date.now(), updatedAt: Date.now(),
+  };
+  store.coverage.push(c);
+  return c;
+}
+app.get('/api/coverage', requireAuth, (req, res) => {
+  let out = store.coverage;
+  const { client, month } = req.query;
+  if (client) out = out.filter(c => c.clientId === client || (c.clientName || '').toLowerCase() === String(client).toLowerCase());
+  if (month) out = out.filter(c => c.month === month);
+  res.json({ coverage: out });
+});
+app.post('/api/coverage', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const list = Array.isArray(body) ? body : (Array.isArray(body.coverage) ? body.coverage : [body]);
+  const out = []; for (const item of list) { const c = upsertCoverage(item); if (c) out.push(c); }
+  saveStore();
+  res.json({ ok: true, upserted: out.length, coverage: out });
+});
+app.patch('/api/coverage/:id', requireAuth, (req, res) => {
+  const c = store.coverage.find(x => x.id === req.params.id);
+  if (!c) return res.status(404).json({ ok: false, error: 'not found' });
+  const b = req.body || {};
+  for (const k of ['title', 'outlet', 'outletDomain', 'screenshot', 'clientName', ...COV_NUM]) {
+    if (b[k] !== undefined) c[k] = COV_NUM.includes(k) ? (+b[k] || 0) : b[k];
+  }
+  if (b.date !== undefined) { c.date = b.date; c.month = monthOf(b.date); }
+  c.edited = true; c.updatedAt = Date.now();
+  saveStore();
+  res.json({ ok: true, coverage: c });
+});
+app.delete('/api/coverage/:id', requireAuth, (req, res) => {
+  const c = store.coverage.find(x => x.id === req.params.id);
+  const before = store.coverage.length;
+  store.coverage = store.coverage.filter(x => x.id !== req.params.id);
+  if (c) store.coverageSuppress[coverageKey(c.clientId, c.url)] = Date.now();  // never re-file
+  saveStore();
+  res.json({ ok: true, removed: before - store.coverage.length });
 });
 
 // ── Asana integration (live two-way) ───────────────────────────────
@@ -930,11 +1096,14 @@ app.post('/api/mentions/clear', requireAuth, (req, res) => {
   sweep().catch(() => {});
 });
 
-setInterval(() => { sweep().catch(() => {}); }, CHECK_MINUTES * 60 * 1000);
-setTimeout(() => { sweep().catch(() => {}); }, 3000);
-
-app.listen(PORT, () => {
-  console.log(`Clippings backend listening on :${PORT}`);
-  console.log(`  OpenPageRank: ${OPR_KEY ? 'configured' : 'not set'} · SimilarWeb: ${SIMILARWEB_KEY ? 'configured' : 'not set'}`);
-  console.log(`  Monitoring every ${CHECK_MINUTES} min · region ${NEWS_REGION}`);
-});
+(async () => {
+  await loadStoreRemote();   // restore the durable copy before we start serving
+  app.listen(PORT, () => {
+    console.log(`Clippings backend listening on :${PORT}`);
+    console.log(`  OpenPageRank: ${OPR_KEY ? 'configured' : 'not set'} · SimilarWeb: ${SIMILARWEB_KEY ? 'configured' : 'not set'}`);
+    console.log(`  Monitoring every ${CHECK_MINUTES} min · region ${NEWS_REGION}`);
+    console.log(`  Durable store: ${REMOTE_ENABLED ? STORE_REPO + ' (private repo)' : 'local file only'}`);
+  });
+  setInterval(() => { sweep().catch(() => {}); }, CHECK_MINUTES * 60 * 1000);
+  setTimeout(() => { sweep().catch(() => {}); }, 3000);
+})();
