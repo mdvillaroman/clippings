@@ -1322,6 +1322,40 @@ function fmtDateShort(s) {
   catch { return s; }
 }
 
+// ── Shared date-range filter (Newsroom + Coverage books) ─────────────
+// range: all | 7 | 30 | 90 | year | custom. Items with no/unparseable date
+// are kept only on "all" and excluded from any bounded range.
+function inDateRange(dateStr, range, from, to) {
+  if (!range || range === 'all') return true;
+  const t = Date.parse(dateStr || '');
+  if (!t) return false;
+  if (range === 'custom') {
+    if (from) { const f = Date.parse(from + 'T00:00:00'); if (f && t < f) return false; }
+    if (to)   { const e = Date.parse(to   + 'T23:59:59'); if (e && t > e) return false; }
+    return true;
+  }
+  if (range === 'year') return new Date(t).getFullYear() === new Date().getFullYear();
+  const days = parseInt(range, 10);
+  if (!days) return true;
+  return t >= (Date.now() - days * 864e5);
+}
+// Builds the preset dropdown + custom from/to inputs. stVar is the global
+// state-object name and refreshCall the re-render call, both used inline.
+function dateFilterControls(pfx, st, stVar, refreshCall) {
+  const r = st.range || 'all';
+  const opt = (v, l) => `<option value="${v}"${r === v ? ' selected' : ''}>${l}</option>`;
+  const toggle = `document.getElementById('${pfx}-custom').style.display=this.value==='custom'?'flex':'none'`;
+  return `
+    <select id="${pfx}-range" class="input" style="max-width:165px;" onchange="${stVar}.range=this.value;${toggle};${refreshCall}">
+      ${opt('all', 'All dates')}${opt('7', 'Last 7 days')}${opt('30', 'Last 30 days')}${opt('90', 'Last 90 days')}${opt('year', 'This year')}${opt('custom', 'Custom range…')}
+    </select>
+    <div id="${pfx}-custom" style="display:${r === 'custom' ? 'flex' : 'none'};gap:6px;align-items:center;">
+      <input type="date" id="${pfx}-from" class="input" style="max-width:150px;" value="${esc(st.from || '')}" onchange="${stVar}.from=this.value;${refreshCall}">
+      <span style="color:var(--ink-3);font-size:.8rem;">to</span>
+      <input type="date" id="${pfx}-to" class="input" style="max-width:150px;" value="${esc(st.to || '')}" onchange="${stVar}.to=this.value;${refreshCall}">
+    </div>`;
+}
+
 function bookStats(b) {
   const clips = b.clips || [];
   const outlets = [...new Set(clips.map(c => c.outlet).filter(Boolean))];
@@ -2443,7 +2477,7 @@ function opportunityToPitch(i) {
 // PAGE: NEWSROOM — live news crawl across all clients (shared)
 // ═══════════════════════════════════════════════════════════════════
 let _mentions = [];
-let _nrFilter = { q: '', client: 'all', sort: 'found-desc' };
+let _nrFilter = { q: '', client: 'all', sort: 'found-desc', range: 'all', from: '', to: '' };
 function pageNewsroom() {
   setTimeout(loadNewsroom, 0);
   return `
@@ -2470,6 +2504,7 @@ function pageNewsroom() {
         <svg width="14" height="14" fill="none" stroke="var(--ink-3)" stroke-width="1.7" viewBox="0 0 24 24" style="position:absolute;left:13px;top:50%;transform:translateY(-50%);pointer-events:none;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         <input id="nr-q" class="input" placeholder="Search headline, outlet, keyword…" style="padding-left:36px;" value="${esc(_nrFilter.q)}" oninput="_nrFilter.q=this.value;renderNewsroomList()" autocomplete="off">
       </div>
+      ${dateFilterControls('nr', _nrFilter, '_nrFilter', 'renderNewsroomList()')}
       <select id="nr-sort" class="input" style="max-width:185px;" onchange="_nrFilter.sort=this.value;renderNewsroomList()">
         <option value="found-desc">Newest found</option>
         <option value="date-desc">Publish date — newest</option>
@@ -2523,6 +2558,8 @@ function renderNewsroomList() {
   const q = (_nrFilter.q || '').toLowerCase().trim();
   if (q) list = list.filter(m => `${m.title || ''} ${m.outlet || ''} ${m.keyword || ''} ${m.clientName || ''}`.toLowerCase().includes(q));
   if (activeClient) list = list.filter(m => (m.clientName || '') === activeClient);
+  const dateOn = _nrFilter.range && _nrFilter.range !== 'all';
+  if (dateOn) list = list.filter(m => inDateRange(m.date, _nrFilter.range, _nrFilter.from, _nrFilter.to));
   const dnum = m => Date.parse(m.date || 0) || 0;
   const fnum = m => Date.parse(m.foundAt || m.date || 0) || 0;
   const s = _nrFilter.sort;
@@ -2531,7 +2568,7 @@ function renderNewsroomList() {
   else if (s === 'outlet') list.sort((a, b) => (a.outlet || '').localeCompare(b.outlet || '') || fnum(b) - fnum(a));
   else if (s === 'client') list.sort((a, b) => (a.clientName || '').localeCompare(b.clientName || '') || fnum(b) - fnum(a));
   else list.sort((a, b) => fnum(b) - fnum(a)); // found-desc (default)
-  const filtered = !!q;
+  const filtered = !!q || dateOn;
   if (countEl) countEl.textContent = `${list.length} mention${list.length !== 1 ? 's' : ''}${filtered ? ' (filtered)' : ''} · ${activeClient || 'all clients'}`;
   if (!list.length) { el.innerHTML = `<div style="text-align:center;padding:56px 0;color:var(--ink-3);font-size:.86rem;">No mentions match this filter.</div>`; return; }
   el.innerHTML = `<div style="display:flex;flex-direction:column;gap:10px;">${list.map(m => newsroomRow(m)).join('')}</div>`;
@@ -3430,6 +3467,7 @@ function pageBook(b) {
   </div>`;
 }
 
+let _clipFilter = { range: 'all', from: '', to: '' };
 function renderClipsTab(b) {
   const clips = b.clips || [];
   const accent = b.accentColor || '#2d5f3d';
@@ -3443,10 +3481,29 @@ function renderClipsTab(b) {
       <button onclick="openAddModal('${b.id}')" class="btn btn-primary btn-lg">+ Add coverage</button>
     </div>`;
 
+  return `
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:24px;">
+      <span class="eyebrow" style="margin-right:2px;">Filter by date</span>
+      ${dateFilterControls('clip', _clipFilter, '_clipFilter', 'refreshClipList()')}
+      <span id="clip-filter-count" class="eyebrow" style="margin-left:auto;">${clipCountText(b)}</span>
+    </div>
+    <div id="clip-list">${renderClipList(b)}</div>`;
+}
+
+function filteredClips(b) { return (b.clips || []).filter(c => inDateRange(c.date, _clipFilter.range, _clipFilter.from, _clipFilter.to)); }
+function clipCountText(b) {
+  const all = (b.clips || []).length, shown = filteredClips(b).length;
+  const on = _clipFilter.range && _clipFilter.range !== 'all';
+  return on ? `${shown} of ${all} shown` : `${all} piece${all !== 1 ? 's' : ''}`;
+}
+// Date-filtered hero + grid; swapped into #clip-list when the filter changes.
+function renderClipList(b) {
+  const accent = b.accentColor || '#2d5f3d';
+  const clips = filteredClips(b);
+  if (clips.length === 0) return `<div style="text-align:center;padding:60px 0;color:var(--ink-3);font-size:.86rem;border:1px dashed var(--rule);border-radius:var(--radius-lg);">No coverage in this date range. Try widening it or pick “All dates”.</div>`;
   const sorted = [...clips].sort((a, b) => (+b.domainAuthority || 0) - (+a.domainAuthority || 0));
   const hero = sorted[0];
   const rest = sorted.slice(1);
-
   return `
     ${heroClipCard(hero, b.id, accent)}
     ${rest.length > 0 ? `
@@ -3454,6 +3511,12 @@ function renderClipsTab(b) {
         ${rest.map(c => clipCard(c, b.id, accent)).join('')}
       </div>
     ` : ''}`;
+}
+function refreshClipList() {
+  const b = nav.bookId ? books.find(x => x.id === nav.bookId) : null;
+  if (!b) return;
+  const el = document.getElementById('clip-list'); if (el) el.innerHTML = renderClipList(b);
+  const cEl = document.getElementById('clip-filter-count'); if (cEl) cEl.textContent = clipCountText(b);
 }
 
 function clipActions(bookId, clipId) {
